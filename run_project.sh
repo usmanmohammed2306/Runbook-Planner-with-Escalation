@@ -23,6 +23,29 @@ cd "$REPO_ROOT"
 log() { echo "[run] $*"; }
 
 # ---------------------------------------------------------------------------
+# CUDA module + toolchain (HPC cluster with Environment Modules / Lmod)
+# Mirrors setup_env.sh so vLLM sees the right nvcc / libs at serve time.
+# ---------------------------------------------------------------------------
+CUDA_MODULE="${CUDA_MODULE:-cuda-12.6.1-gcc-12.1.0}"
+if command -v module >/dev/null 2>&1; then
+  log "Loading CUDA module: $CUDA_MODULE"
+  module load "$CUDA_MODULE" || log "WARNING: module load $CUDA_MODULE failed; continuing"
+fi
+if command -v nvcc >/dev/null 2>&1; then
+  export CUDA_HOME="$(dirname "$(dirname "$(which nvcc)")")"
+  export PATH="$CUDA_HOME/bin:$PATH"
+  export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+  log "CUDA_HOME=$CUDA_HOME"
+fi
+
+# ---------------------------------------------------------------------------
+# Hugging Face token (gated model downloads)
+# ---------------------------------------------------------------------------
+export HF_TOKEN="${HF_TOKEN:-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}"
+export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
+export HUGGINGFACEHUB_API_TOKEN="$HF_TOKEN"
+
+# ---------------------------------------------------------------------------
 # Scratch / cache exports (mirror setup_env.sh)
 # ---------------------------------------------------------------------------
 : "${PROJECT_SCRATCH:=${REPO_ROOT}/.scratch}"
