@@ -1,0 +1,9 @@
+.venv/
+.scratch/
+external/
+outputs/
+__pycache__/
+*.pyc
+*.pyo
+*.log
+.DS_Store
