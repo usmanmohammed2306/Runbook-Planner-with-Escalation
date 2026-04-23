@@ -1,0 +1,35 @@
+model:
+  served_name: qwen-agent
+  candidates:
+    - Qwen/Qwen3-4B-Instruct-2507-FP8
+    - Qwen/Qwen3-4B-Instruct-2507
+    - Qwen/Qwen2.5-7B-Instruct
+
+vllm:
+  port: 8001
+  max_model_len: 8192
+  gpu_memory_utilization: 0.85
+  dtype: auto
+  tool_call_parser: hermes
+
+tau_bench:
+  task_split: test
+  start_index: 0
+  end_index: 20
+  num_trials: 1
+  max_concurrency: 1
+  temperature: 0.0
+  max_num_steps: 30
+
+acebench:
+  language: en
+  category: agent
+  limit: 30
+  max_num_steps: 20
+  temperature: 0.0
+
+rpe:
+  replan_every_steps: 1
+  max_escalations: 2
+  planner_max_tokens: 768
+  decide_max_tokens: 512

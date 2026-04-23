@@ -1,0 +1,15 @@
+# Core inference
+vllm>=0.10.0,<0.13.0
+transformers>=4.51.0
+accelerate>=0.33.0
+
+# OpenAI-compatible client + tau-bench runtime
+openai>=1.50.0
+litellm>=1.50.0
+
+# Utilities
+pyyaml>=6.0
+requests>=2.31
+numpy
+tqdm
+tenacity
