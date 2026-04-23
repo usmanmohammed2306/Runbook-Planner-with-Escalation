@@ -16,6 +16,39 @@ cd "$REPO_ROOT"
 log() { echo "[setup] $*"; }
 
 # ---------------------------------------------------------------------------
+# CUDA module + toolchain (HPC cluster with Environment Modules / Lmod)
+# ---------------------------------------------------------------------------
+CUDA_MODULE="${CUDA_MODULE:-cuda-12.6.1-gcc-12.1.0}"
+if command -v module >/dev/null 2>&1; then
+  log "Loading CUDA module: $CUDA_MODULE"
+  # `module` is a shell function; `|| true` keeps the script alive if the
+  # module is already loaded or unavailable on this host.
+  module load "$CUDA_MODULE" || log "WARNING: module load $CUDA_MODULE failed; continuing with whatever nvcc is on PATH"
+else
+  log "No 'module' command on PATH; skipping module load (use system CUDA)"
+fi
+
+if command -v nvcc >/dev/null 2>&1; then
+  export CUDA_HOME="$(dirname "$(dirname "$(which nvcc)")")"
+  export PATH="$CUDA_HOME/bin:$PATH"
+  export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+  log "CUDA_HOME=$CUDA_HOME"
+  log "nvcc: $(nvcc --version | tail -n 1)"
+else
+  log "WARNING: nvcc not found; vLLM install may fail without CUDA toolkit."
+fi
+
+# ---------------------------------------------------------------------------
+# Hugging Face token (gated model downloads)
+# Override by exporting HF_TOKEN before running this script.
+# NOTE: tokens committed to source are visible to anyone with repo access;
+# rotate at https://huggingface.co/settings/tokens if this leaks.
+# ---------------------------------------------------------------------------
+export HF_TOKEN="${HF_TOKEN:-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}"
+export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
+export HUGGINGFACEHUB_API_TOKEN="$HF_TOKEN"
+
+# ---------------------------------------------------------------------------
 # Scratch / cache exports
 # ---------------------------------------------------------------------------
 : "${PROJECT_SCRATCH:=${REPO_ROOT}/.scratch}"
@@ -58,6 +91,11 @@ fi
 source "$VENV_DIR/bin/activate"
 
 python -m pip install --upgrade pip wheel setuptools
+
+# Persist HF token for huggingface_hub / vLLM downloads.
+mkdir -p "$HF_HOME"
+printf '%s' "$HF_TOKEN" > "$HF_HOME/token"
+chmod 600 "$HF_HOME/token" || true
 
 # ---------------------------------------------------------------------------
 # Install core requirements (vLLM pulls torch with a compatible CUDA wheel)
@@ -117,11 +155,23 @@ for name in ["torch", "transformers", "vllm", "openai", "litellm", "tau_bench"]:
 
 try:
     import torch
+    print("  torch.version.cuda:", torch.version.cuda)
     print("  cuda_available:", torch.cuda.is_available())
     if torch.cuda.is_available():
         print("  device:", torch.cuda.get_device_name(0))
         cap = torch.cuda.get_device_capability(0)
         print("  capability:", f"{cap[0]}.{cap[1]}")
+    # Warn if the torch CUDA runtime and the loaded toolkit major differ.
+    import os, re
+    tv = (torch.version.cuda or "")
+    sys_cuda = os.environ.get("CUDA_HOME", "")
+    m = re.search(r"cuda[-/]?(\d+)\.(\d+)", sys_cuda)
+    if tv and m:
+        t_major = tv.split(".")[0]
+        s_major = m.group(1)
+        if t_major != s_major:
+            print(f"  WARNING: torch CUDA major ({tv}) != module CUDA major ({m.group(0)}). "
+                  "vLLM may still work (it ships its own CUDA libs), but build-from-source steps may break.")
 except Exception as e:
     print("  torch probe failed:", e, file=sys.stderr)
 PY
