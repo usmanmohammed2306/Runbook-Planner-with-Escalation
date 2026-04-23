@@ -174,22 +174,21 @@ ensure_req_file () {
   if req_file_satisfied "$1"; then log "Requirement file already satisfied: $1"; else log "Installing requirement file: $1"; uv pip install -r "$1"; fi
 }
 
-make_filtered_build_requirements () {
-  # Strip torch/torchvision/torchaudio/nvidia-*/triton plus --extra-index-url so
-  # building vLLM doesn't overwrite our carefully pinned cu130 torch stack.
-  python - "$1" "$2" <<'PY'
+make_filtered_requirements () {
+  # Strip packages from an upstream requirements file so installing it can't
+  # clobber our cu130 torch stack or our from-source vLLM build.
+  #
+  #   $1 = source requirements file
+  #   $2 = destination filtered file
+  #   $3 = space-separated exact package names to skip (normalized: lowercase, _→-)
+  #   $4 = space-separated name-prefixes to skip (e.g. "nvidia-")
+  #   $5 = space-separated line-prefixes to drop (e.g. "--extra-index-url -i")
+  python - "$1" "$2" "$3" "$4" "$5" <<'PY'
 import pathlib, re, sys
 src, dst = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
-skip_prefixes = ("--extra-index-url",)
-skip_names = {
-    "torch", "torchvision", "torchaudio",
-    "nvidia-nccl-cu13", "nvidia-cublas-cu13", "nvidia-cuda-runtime-cu13",
-    "nvidia-cuda-nvrtc-cu13", "nvidia-cuda-cupti-cu13", "nvidia-cudnn-cu13",
-    "nvidia-cufft-cu13", "nvidia-cufile", "nvidia-curand-cu13",
-    "nvidia-cusolver-cu13", "nvidia-cusparse-cu13", "nvidia-cusparselt-cu13",
-    "nvidia-nvjitlink", "nvidia-nvjitlink-cu13", "nvidia-nvtx", "nvidia-nvtx-cu13",
-    "triton",
-}
+skip_names = set(sys.argv[3].split())
+skip_name_prefixes = tuple(sys.argv[4].split())
+skip_line_prefixes = tuple(sys.argv[5].split())
 def nn(s):
     m = re.match(r'^\s*([A-Za-z0-9_.-]+)', s)
     return m.group(1).lower().replace("_","-") if m else ""
@@ -198,10 +197,76 @@ for raw in src.read_text().splitlines():
     line = raw.strip()
     if not line or line.startswith("#"):
         out.append(raw); continue
-    if any(line.startswith(p) for p in skip_prefixes): continue
-    if nn(line) in skip_names: continue
+    if any(line.startswith(p) for p in skip_line_prefixes): continue
+    n = nn(line)
+    if n in skip_names: continue
+    if any(n.startswith(p) for p in skip_name_prefixes): continue
     out.append(raw)
 dst.write_text("\n".join(out) + "\n")
+PY
+}
+
+# Skip-set used for vLLM build.txt: strip torch + nvidia-* + triton + --extra-index-url
+# so the build resolver can't overwrite our cu130 stack.
+filter_vllm_build_requirements () {
+  make_filtered_requirements "$1" "$2" \
+    "torch torchvision torchaudio triton" \
+    "nvidia-" \
+    "--extra-index-url -i"
+}
+
+# Skip-set used for ACEBench's requirements.txt: same torch-family block, plus
+# vllm (we build from source at a different version), xformers (torch-version
+# sensitive), and any nvidia-*-cu12 packages (we're on cu13).
+filter_acebench_requirements () {
+  make_filtered_requirements "$1" "$2" \
+    "torch torchvision torchaudio triton vllm vllm-flash-attn xformers" \
+    "nvidia-" \
+    "--extra-index-url -i"
+}
+
+# CUDA 13 removed libnvToolsExt.so (nvtx is now a header-only library). The
+# torch 2.10.0+cu130 wheel ships a Caffe2/public/cuda.cmake that still calls
+# FATAL_ERROR when find_library(nvToolsExt) fails, which breaks any project
+# building against torch. Downgrade that failure to a soft STATUS and leave
+# CUDA_nvToolsExt_LIBRARY empty — the downstream target torch::nvtoolsext
+# then becomes a no-op INTERFACE target, which is the right behavior on
+# CUDA 13+.
+patch_torch_nvtx_for_cuda13 () {
+  local cuda_cmake
+  cuda_cmake="$(find "$VENV_DIR/lib" -path '*/torch/share/cmake/Caffe2/public/cuda.cmake' 2>/dev/null | head -n1)"
+  if [[ -z "$cuda_cmake" || ! -f "$cuda_cmake" ]]; then
+    log "No torch cuda.cmake found; skipping nvtx CUDA-13 patch"
+    return 0
+  fi
+  if ! grep -qE 'FATAL_ERROR[[:space:]]+"Failed to find nvToolsExt"' "$cuda_cmake"; then
+    log "torch cuda.cmake: already patched or no nvToolsExt FATAL_ERROR"
+    return 0
+  fi
+  log "Patching $cuda_cmake for CUDA 13 (libnvToolsExt.so removed upstream)"
+  python - "$cuda_cmake" <<'PY'
+import pathlib, re, sys
+p = pathlib.Path(sys.argv[1])
+s = p.read_text()
+needle = 'if(NOT CUDA_nvToolsExt_LIBRARY)\n    message(FATAL_ERROR "Failed to find nvToolsExt")\nendif()'
+replacement = (
+    'if(NOT CUDA_nvToolsExt_LIBRARY)\n'
+    '    message(STATUS "nvToolsExt not found; CUDA 13 removed libnvToolsExt.so. "\n'
+    '                   "Using empty stub; torch::nvtoolsext becomes a no-op target.")\n'
+    '    set(CUDA_nvToolsExt_LIBRARY "")\n'
+    'endif()'
+)
+if needle in s:
+    p.write_text(s.replace(needle, replacement))
+    print("patched (exact)")
+    sys.exit(0)
+s2 = re.sub(r'message\(FATAL_ERROR\s+"Failed to find nvToolsExt"\s*\)',
+            'message(STATUS "nvToolsExt missing on CUDA 13+; continuing")', s)
+if s2 != s:
+    p.write_text(s2)
+    print("patched (regex)")
+else:
+    print("no-op (pattern not found)")
 PY
 }
 
@@ -439,8 +504,17 @@ else
   log "ACEBench already at $ACE_DIR"
 fi
 if [[ -f "$ACE_DIR/requirements.txt" ]]; then
-  log "Installing ACEBench requirements.txt"
-  uv pip install -r "$ACE_DIR/requirements.txt" || log "WARNING: ACEBench requirements install had issues"
+  # ACEBench's requirements.txt pins torch==2.4.0 / torchvision==0.19.0 /
+  # triton==3.0.0 / vllm==0.6.1.post1 / xformers and a full nvidia-*-cu12
+  # stack. Installing it as-is clobbers our cu130 torch build. Filter to
+  # drop those before install, then re-check the torch stack afterwards.
+  FILTERED_ACE_REQ="$TMPDIR/acebench-requirements.txt"
+  filter_acebench_requirements "$ACE_DIR/requirements.txt" "$FILTERED_ACE_REQ"
+  log "Installing ACEBench requirements.txt (filtered: torch/vllm/nvidia-* stripped)"
+  uv pip install -r "$FILTERED_ACE_REQ" || log "WARNING: ACEBench filtered requirements install had issues"
+  # Defensive: ensure_pytorch_stack re-pins torch to our cu130 trio if a
+  # transitive dep pulled in a different variant anyway.
+  ensure_pytorch_stack
 fi
 
 # ---------------------------------------------------------------------------
@@ -483,8 +557,14 @@ if (( need_rebuild )); then
   rm -rf "$TORCH_EXTENSIONS_DIR"/* 2>/dev/null || true
 
   FILTERED_BUILD_REQ="$TMPDIR/vllm-build-requirements.txt"
-  make_filtered_build_requirements "$VLLM_SRC_DIR/requirements/build.txt" "$FILTERED_BUILD_REQ"
+  filter_vllm_build_requirements "$VLLM_SRC_DIR/requirements/build.txt" "$FILTERED_BUILD_REQ"
   ensure_req_file "$FILTERED_BUILD_REQ"
+
+  # torch 2.10.0+cu130's Caffe2/public/cuda.cmake still FATAL_ERRORs when it
+  # can't find libnvToolsExt.so, but CUDA 13 removed that library (nvtx is
+  # now header-only). Patch it in place before the build so cmake treats
+  # nvtx as a no-op target instead of aborting.
+  patch_torch_nvtx_for_cuda13
 
   log "Building vLLM (editable, --no-build-isolation) with TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-unset}"
   (cd "$VLLM_SRC_DIR" && uv pip install --no-build-isolation -e .)
