@@ -1,5 +1,9 @@
-# Core inference
-vllm>=0.10.0,<0.13.0
+# NOTE: torch / torchvision / torchaudio are installed by setup_env.sh from the
+# cu130 index and MUST NOT appear here. vLLM is built from source at v0.18.0 by
+# setup_env.sh and also MUST NOT appear here.
+
+# Core inference (torch-aware libs — installed AFTER the cu130 torch stack so
+# they see a satisfied torch and don't pull a different variant).
 transformers>=4.51.0
 accelerate>=0.33.0
 
@@ -10,6 +14,5 @@ litellm>=1.50.0
 # Utilities
 pyyaml>=6.0
 requests>=2.31
-numpy
 tqdm
 tenacity
