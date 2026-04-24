@@ -53,7 +53,9 @@ def _collect_tau_results(output_dir: str) -> List[Dict[str, Any]]:
     """Parse tau-bench's per-trial JSON files under output_dir into a flat list."""
     results: List[Dict[str, Any]] = []
     out = Path(output_dir)
-    for path in sorted(out.rglob("results-*.json")) + sorted(out.rglob("results.json")):
+    # tau-bench baseline creates files like tool-calling-qwen-agent-*.json
+    # RPE creates results-rpe.json. Accept both patterns.
+    for path in sorted(out.rglob("results-*.json")) + sorted(out.rglob("results.json")) + sorted(out.rglob("*qwen-agent*.json")):
         try:
             data = json.loads(path.read_text())
         except Exception:
