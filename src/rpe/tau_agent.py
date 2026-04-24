@@ -83,6 +83,7 @@ class RpeAgent(Agent):
         total_cost: float = 0.0
         done = False
 
+        step_error: str = ""
         for step in range(max_num_steps):
             # Refresh the system prompt so the live runbook is visible each turn.
             messages[0] = {"role": "system", "content": self._system_prompt(runbook)}
@@ -95,9 +96,25 @@ class RpeAgent(Agent):
                     tool_choice="auto" if self.tools_info else None,
                     temperature=self.temperature,
                 )
-            except Exception as exc:  # pragma: no cover — defensive
-                info["error"] = f"chat_completion_failed: {exc}"
-                break
+            except Exception as exc:
+                exc_str = str(exc)
+                # Context window exceeded: drop the oldest non-system messages and retry once.
+                if "context" in exc_str.lower() and "length" in exc_str.lower() and len(messages) > 3:
+                    messages = [messages[0]] + messages[-6:]
+                    try:
+                        resp = self.client.chat.completions.create(
+                            model=self.model,
+                            messages=messages,
+                            tools=self.tools_info or None,
+                            tool_choice="auto" if self.tools_info else None,
+                            temperature=self.temperature,
+                        )
+                    except Exception as exc2:
+                        step_error = f"chat_completion_failed: {exc2}"
+                        break
+                else:
+                    step_error = f"chat_completion_failed: {exc}"
+                    break
 
             msg = resp.choices[0].message
             assistant_msg = _assistant_message_dict(msg)
@@ -155,6 +172,8 @@ class RpeAgent(Agent):
                 break
 
         info = dict(info) if info else {}
+        if step_error:
+            info["error"] = step_error
         info.setdefault("rpe_runbook_final", runbook.to_dict())
         return SolveResult(
             reward=reward,
