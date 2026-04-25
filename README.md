@@ -106,6 +106,9 @@ Env-var overridable tunables (defaults in `run_project.sh`):
 - `TAU_NUM_TRIALS` — repeats per task
 - `ACE_LIMIT` — ACEBench Agent task cap (default 30)
 - `MAX_MODEL_LEN`, `GPU_MEM_UTIL`, `DTYPE`, `PORT` — vLLM knobs
+- `ENFORCE_EAGER` — set to `1` to skip the CUDA-graphs fast rung and start vLLM
+  in eager mode immediately (slower, but matches the previous known-good config
+  in case CUDA-graph capture fails on your GPU/driver combination)
 
 ## What IG-RPE is and isn't
 
