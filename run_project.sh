@@ -122,12 +122,24 @@ export VLLM_ENGINE_READY_TIMEOUT_S="$VLLM_READY_TIMEOUT"
 # Matched-compile-off config from the known-good baseline run.
 VLLM_COMPILATION_CONFIG='{"mode":0,"custom_ops":["none"],"pass_config":{"fuse_norm_quant":false,"fuse_act_quant":false,"fuse_attn_quant":false}}'
 
-# Primary + fallback (max_model_len, gpu_memory_utilization, model-impl).
-PRIMARY_MAX_LEN="${MAX_MODEL_LEN:-32768}"
-PRIMARY_MEM_UTIL="${GPU_MEM_UTIL:-0.85}"
+# Primary + fallback (max_model_len, gpu_memory_utilization, model-impl, eager).
+# Rung 1 (FAST): CUDA graphs ON — ~2-3x faster decode than eager. If CUDA-graph
+#   capture OOMs at startup or the kernel fails, we automatically drop to rung 2
+#   which is the previous known-good eager config.
+# Rung 2 (SAFE): eager mode at the same context — guaranteed to work since this
+#   was the previously-shipped primary configuration.
+# Rung 3/4: progressively shrink context, finally fall back to transformers backend.
+# Override: set ENFORCE_EAGER=1 to skip rung 1 and go straight to rung 2.
+PRIMARY_MAX_LEN="${MAX_MODEL_LEN:-16384}"
+PRIMARY_MEM_UTIL="${GPU_MEM_UTIL:-0.80}"
 PRIMARY_IMPL="${MODEL_IMPL:-auto}"
-FALLBACK1_IMPL="auto";         FALLBACK1_MAX_LEN="16384"; FALLBACK1_MEM_UTIL="0.75"
+ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
+FALLBACK1_IMPL="auto";         FALLBACK1_MAX_LEN="12288"; FALLBACK1_MEM_UTIL="0.75"
 FALLBACK2_IMPL="transformers"; FALLBACK2_MAX_LEN="8192";  FALLBACK2_MEM_UTIL="0.65"
+
+# Truncation patch is sized for the 16 K context.
+export TAU_PATCH_MAX_TOOL_CHARS="${TAU_PATCH_MAX_TOOL_CHARS:-3000}"
+export TAU_PATCH_SOFT_BUDGET="${TAU_PATCH_SOFT_BUDGET:-40000}"
 
 # Qwen2.5-7B first — stable 32K context, best tool-calling quality at this size.
 MODEL_CANDIDATES=(
@@ -188,11 +200,19 @@ kill_vllm () {
 trap 'kill_vllm' EXIT
 
 start_vllm_once () {
-  local model="$1" impl="$2" max_len="$3" mem_util="$4" label="$5"
+  local model="$1" impl="$2" max_len="$3" mem_util="$4" eager="$5" label="$6"
   local log_file="$OUTPUTS_DIR/vllm.log"
   kill_vllm
   rm -f "$log_file"
-  log "Starting vLLM [$label] model=$model impl=$impl max_len=$max_len mem_util=$mem_util"
+  # `set -u` makes empty arrays brittle in older bash. Use a plain string flag.
+  local eager_flag=""
+  if [[ "$eager" == "1" ]]; then
+    eager_flag="--enforce-eager"
+  fi
+  log "Starting vLLM [$label] model=$model impl=$impl max_len=$max_len mem_util=$mem_util eager=$eager"
+  # NOTE: $eager_flag is intentionally unquoted so the empty case expands to
+  #       nothing (vllm sees no extra arg). When set, it's a single flag with
+  #       no spaces, so word-splitting is safe.
   CUDA_VISIBLE_DEVICES="$GPU" \
     vllm serve "$model" \
       --served-model-name "$SERVED_NAME" \
@@ -204,7 +224,7 @@ start_vllm_once () {
       --enable-auto-tool-choice \
       --tool-call-parser "$TOOL_CALL_PARSER" \
       --disable-log-stats \
-      --enforce-eager \
+      $eager_flag \
       --compilation-config "$VLLM_COMPILATION_CONFIG" \
       > "$log_file" 2>&1 &
   VLLM_PID=$!
@@ -223,12 +243,20 @@ start_vllm_once () {
 
 # ---------------------------------------------------------------------------
 # Try (model candidate × launch config) combos until one serves.
+# Per-model rungs:
+#   1. fast:   CUDA graphs ON, primary context  (skipped if ENFORCE_EAGER=1)
+#   2. safe:   eager,         primary context  (previous known-good config)
+#   3. small:  eager,         12K context
+#   4. cpu-ish: transformers,  8K  context
 # ---------------------------------------------------------------------------
 STARTED=0
 for m in "${MODEL_CANDIDATES[@]}"; do
-  if start_vllm_once "$m" "$PRIMARY_IMPL"   "$PRIMARY_MAX_LEN"   "$PRIMARY_MEM_UTIL"   "primary/$m";      then STARTED=1; break; fi
-  if start_vllm_once "$m" "$FALLBACK1_IMPL" "$FALLBACK1_MAX_LEN" "$FALLBACK1_MEM_UTIL" "auto-4096/$m";    then STARTED=1; break; fi
-  if start_vllm_once "$m" "$FALLBACK2_IMPL" "$FALLBACK2_MAX_LEN" "$FALLBACK2_MEM_UTIL" "transformers-4096/$m"; then STARTED=1; break; fi
+  if [[ "$ENFORCE_EAGER" != "1" ]]; then
+    if start_vllm_once "$m" "$PRIMARY_IMPL"   "$PRIMARY_MAX_LEN"   "$PRIMARY_MEM_UTIL"   "0" "fast/$m";    then STARTED=1; break; fi
+  fi
+  if start_vllm_once   "$m" "$PRIMARY_IMPL"   "$PRIMARY_MAX_LEN"   "$PRIMARY_MEM_UTIL"   "1" "safe/$m";    then STARTED=1; break; fi
+  if start_vllm_once   "$m" "$FALLBACK1_IMPL" "$FALLBACK1_MAX_LEN" "$FALLBACK1_MEM_UTIL" "1" "small/$m";   then STARTED=1; break; fi
+  if start_vllm_once   "$m" "$FALLBACK2_IMPL" "$FALLBACK2_MAX_LEN" "$FALLBACK2_MEM_UTIL" "1" "transformers/$m"; then STARTED=1; break; fi
   log "All configs failed for $m; trying next candidate"
 done
 
