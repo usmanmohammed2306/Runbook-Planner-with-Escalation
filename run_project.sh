@@ -123,11 +123,11 @@ export VLLM_ENGINE_READY_TIMEOUT_S="$VLLM_READY_TIMEOUT"
 VLLM_COMPILATION_CONFIG='{"mode":0,"custom_ops":["none"],"pass_config":{"fuse_norm_quant":false,"fuse_act_quant":false,"fuse_attn_quant":false}}'
 
 # Primary + fallback (max_model_len, gpu_memory_utilization, model-impl).
-PRIMARY_MAX_LEN="${MAX_MODEL_LEN:-16384}"
-PRIMARY_MEM_UTIL="${GPU_MEM_UTIL:-0.75}"
+PRIMARY_MAX_LEN="${MAX_MODEL_LEN:-32768}"
+PRIMARY_MEM_UTIL="${GPU_MEM_UTIL:-0.85}"
 PRIMARY_IMPL="${MODEL_IMPL:-auto}"
-FALLBACK1_IMPL="auto";         FALLBACK1_MAX_LEN="8192"; FALLBACK1_MEM_UTIL="0.70"
-FALLBACK2_IMPL="transformers"; FALLBACK2_MAX_LEN="4096"; FALLBACK2_MEM_UTIL="0.65"
+FALLBACK1_IMPL="auto";         FALLBACK1_MAX_LEN="16384"; FALLBACK1_MEM_UTIL="0.75"
+FALLBACK2_IMPL="transformers"; FALLBACK2_MAX_LEN="8192";  FALLBACK2_MEM_UTIL="0.65"
 
 # Qwen2.5-7B first — stable 32K context, best tool-calling quality at this size.
 MODEL_CANDIDATES=(
