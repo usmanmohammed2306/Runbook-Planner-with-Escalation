@@ -25,42 +25,29 @@ from __future__ import annotations
 import os
 import sys
 
-MAX_TOOL_CHARS = int(os.environ.get("TAU_PATCH_MAX_TOOL_CHARS", "5000"))
-SOFT_TOTAL_CHAR_BUDGET = int(os.environ.get("TAU_PATCH_SOFT_BUDGET", "80000"))
+MAX_TOOL_CHARS = int(os.environ.get("TAU_PATCH_MAX_TOOL_CHARS", "2000"))
+SOFT_TOTAL_CHAR_BUDGET = int(os.environ.get("TAU_PATCH_SOFT_BUDGET", "28000"))
+HARD_TOTAL_CHAR_BUDGET = int(os.environ.get("TAU_PATCH_HARD_BUDGET", "32000"))
 KEEP_SYSTEM_FULL = True
 
 
-def _truncate_one(content):
-    if not isinstance(content, str):
+def _truncate_to(content, cap: int):
+    if not isinstance(content, str) or len(content) <= cap:
         return content
-    if len(content) <= MAX_TOOL_CHARS:
-        return content
-    head = MAX_TOOL_CHARS - 200
+    head = max(200, cap - 200)
     return content[:head] + f"\n...[truncated {len(content) - head} chars to fit context]"
 
 
-def _shrink_messages(messages):
-    if not isinstance(messages, list) or not messages:
-        return messages
-    total = sum(len(m.get("content") or "") if isinstance(m, dict) else 0 for m in messages)
-    if total <= SOFT_TOTAL_CHAR_BUDGET:
-        # Only enforce per-message cap on tool/user messages even when
-        # under budget — a single 200KB observation must always be cut.
-        out = []
-        for m in messages:
-            if not isinstance(m, dict):
-                out.append(m)
-                continue
-            role = m.get("role")
-            if role in ("tool", "user") and isinstance(m.get("content"), str) and len(m["content"]) > MAX_TOOL_CHARS:
-                m = {**m, "content": _truncate_one(m["content"])}
-            out.append(m)
-        return out
+def _total_content_chars(messages):
+    return sum(len(m.get("content") or "") if isinstance(m, dict) else 0 for m in messages)
 
-    # Over budget — be more aggressive. Keep system message untouched, keep
-    # the last 12 messages, truncate every other tool/user content hard.
+
+def _shrink_pass(messages, recent_cap: int, old_cap: int, recent_keep: int):
+    """Single truncation pass. System messages are preserved verbatim. The last
+    ``recent_keep`` non-system messages keep ``recent_cap`` chars; older
+    tool/user messages are capped to ``old_cap``."""
+    last_keep_idx = max(0, len(messages) - recent_keep)
     out = []
-    last_keep = len(messages) - 12
     for i, m in enumerate(messages):
         if not isinstance(m, dict):
             out.append(m)
@@ -70,12 +57,61 @@ def _shrink_messages(messages):
             out.append(m)
             continue
         if role in ("tool", "user"):
-            cap = MAX_TOOL_CHARS if i >= last_keep else max(800, MAX_TOOL_CHARS // 4)
+            cap = recent_cap if i >= last_keep_idx else old_cap
             content = m.get("content")
             if isinstance(content, str) and len(content) > cap:
-                head = cap - 200
-                m = {**m, "content": content[:head] + f"\n...[truncated {len(content) - head} chars]"}
+                m = {**m, "content": _truncate_to(content, cap)}
         out.append(m)
+    return out
+
+
+def _shrink_messages(messages):
+    """Iteratively shrink until under the hard budget.
+
+    Strategy
+    --------
+    1. If total content is under the soft budget, only cap individual oversized
+       tool/user observations (a single 200 KB JSON blob must always be cut).
+    2. Otherwise, run a normal truncation pass: last 6 messages full
+       ``MAX_TOOL_CHARS`` each, older capped to ``MAX_TOOL_CHARS // 5``.
+    3. If the result is still over the hard budget (long trajectories with many
+       recent tool observations), run an aggressive pass: last 4 messages
+       capped at ``MAX_TOOL_CHARS // 2``, older capped at 400 chars.
+    4. As a last-resort guard, run an extreme pass: last 3 messages at 1000
+       chars, everything else at 250.
+
+    The hard budget defaults to 32 K chars ≈ ~10 K tokens at tau-bench's
+    JSON-heavy density, leaving headroom under the 16 K-token model context
+    for the system prompt + tool schemas (~3 K tokens) and decode (~1.5 K).
+    """
+    if not isinstance(messages, list) or not messages:
+        return messages
+
+    total = _total_content_chars(messages)
+    if total <= SOFT_TOTAL_CHAR_BUDGET:
+        out = []
+        for m in messages:
+            if not isinstance(m, dict):
+                out.append(m)
+                continue
+            role = m.get("role")
+            if role in ("tool", "user") and isinstance(m.get("content"), str) and len(m["content"]) > MAX_TOOL_CHARS:
+                m = {**m, "content": _truncate_to(m["content"], MAX_TOOL_CHARS)}
+            out.append(m)
+        return out
+
+    old_cap_normal = max(400, MAX_TOOL_CHARS // 5)
+    out = _shrink_pass(messages, recent_cap=MAX_TOOL_CHARS, old_cap=old_cap_normal, recent_keep=6)
+    if _total_content_chars(out) <= HARD_TOTAL_CHAR_BUDGET:
+        return out
+
+    aggressive_recent = max(800, MAX_TOOL_CHARS // 2)
+    out = _shrink_pass(out, recent_cap=aggressive_recent, old_cap=400, recent_keep=4)
+    if _total_content_chars(out) <= HARD_TOTAL_CHAR_BUDGET:
+        return out
+
+    # Last-resort: floor everything.
+    out = _shrink_pass(out, recent_cap=1000, old_cap=250, recent_keep=3)
     return out
 
 
@@ -113,7 +149,8 @@ def _install():
         pass
     _llmain._tau_patched = True
     print("[tau_patch] litellm.completion patched (max_tool_chars="
-          f"{MAX_TOOL_CHARS}, soft_budget={SOFT_TOTAL_CHAR_BUDGET})", file=sys.stderr)
+          f"{MAX_TOOL_CHARS}, soft_budget={SOFT_TOTAL_CHAR_BUDGET}, "
+          f"hard_budget={HARD_TOTAL_CHAR_BUDGET})", file=sys.stderr)
 
 
 _install()

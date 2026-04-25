@@ -137,9 +137,12 @@ ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
 FALLBACK1_IMPL="auto";         FALLBACK1_MAX_LEN="12288"; FALLBACK1_MEM_UTIL="0.75"
 FALLBACK2_IMPL="transformers"; FALLBACK2_MAX_LEN="8192";  FALLBACK2_MEM_UTIL="0.65"
 
-# Truncation patch is sized for the 16 K context.
-export TAU_PATCH_MAX_TOOL_CHARS="${TAU_PATCH_MAX_TOOL_CHARS:-3000}"
-export TAU_PATCH_SOFT_BUDGET="${TAU_PATCH_SOFT_BUDGET:-40000}"
+# Truncation patch is sized for the 16 K context. The hard budget triggers
+# the patch's iterative shrink: if a normal pass leaves the prompt over
+# HARD_BUDGET chars, the patch keeps shrinking until it fits.
+export TAU_PATCH_MAX_TOOL_CHARS="${TAU_PATCH_MAX_TOOL_CHARS:-2000}"
+export TAU_PATCH_SOFT_BUDGET="${TAU_PATCH_SOFT_BUDGET:-28000}"
+export TAU_PATCH_HARD_BUDGET="${TAU_PATCH_HARD_BUDGET:-32000}"
 
 # Qwen2.5-7B first — stable 32K context, best tool-calling quality at this size.
 MODEL_CANDIDATES=(
