@@ -31,7 +31,7 @@ from ..common.io_utils import append_jsonl, ensure_dir, safe_mean, write_json
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser("tau_runner")
     p.add_argument("--env", required=True, choices=["retail", "airline"])
-    p.add_argument("--agent", required=True, choices=["baseline", "rpe"])
+    p.add_argument("--agent", required=True, choices=["baseline", "rpe", "igrpe"])
     p.add_argument("--model", required=True)
     p.add_argument("--user-model", required=True)
     p.add_argument("--model-provider", default="openai")
@@ -55,7 +55,7 @@ def _collect_tau_results(output_dir: str) -> List[Dict[str, Any]]:
     out = Path(output_dir)
     # tau-bench baseline creates files like tool-calling-qwen-agent-*.json
     # RPE creates results-rpe.json. Accept both patterns.
-    for path in sorted(out.rglob("results-*.json")) + sorted(out.rglob("results.json")) + sorted(out.rglob("*qwen-agent*.json")):
+    for path in sorted(out.rglob("results-*.json")) + sorted(out.rglob("results.json")) + sorted(out.rglob("results-igrpe.json")) + sorted(out.rglob("*qwen-agent*.json")):
         try:
             data = json.loads(path.read_text())
         except Exception:
@@ -128,24 +128,27 @@ def _run_baseline_subprocess(ns: argparse.Namespace) -> int:
     return subprocess.call(cmd, cwd=str(tau_dir))
 
 
-def _run_rpe_inprocess(ns: argparse.Namespace) -> None:
-    """Drive RPE directly against tau-bench's env loader.
+def _run_rpe_inprocess(ns: argparse.Namespace, agent_kind: str = "rpe") -> None:
+    """Drive RPE or IG-RPE directly against tau-bench's env loader.
 
     This intentionally avoids tau-bench's CLI (whose ``--agent-strategy`` flag
-    has a fixed choice list that doesn't include ``rpe``) and its internal
-    ``tau_bench.run.run()`` function (whose signature varies across versions).
-    Instead we iterate the task range, construct a fresh env per task via
-    ``tau_bench.envs.get_env``, solve with :class:`RpeAgent`, and persist
-    results in a tau-bench-compatible ``results.json`` shape so the summary
-    builder works uniformly.
+    has a fixed choice list that doesn't include ``rpe`` or ``igrpe``) and its
+    internal ``tau_bench.run.run()`` function (whose signature varies across
+    versions). Instead we iterate the task range, construct a fresh env per
+    task via ``tau_bench.envs.get_env``, solve with the appropriate agent, and
+    persist results in a tau-bench-compatible ``results.json`` shape so the
+    summary builder works uniformly.
     """
     from tau_bench.envs import get_env  # type: ignore
 
-    from ..rpe.tau_agent import RpeAgent
+    if agent_kind == "igrpe":
+        from ..ig_rpe.tau_agent import IgRpeAgent as _AgentCls
+    else:
+        from ..rpe.tau_agent import RpeAgent as _AgentCls
 
     out_dir = Path(ns.output_dir)
     ensure_dir(out_dir)
-    traj_path = out_dir / "results-rpe.json"
+    traj_path = out_dir / f"results-{agent_kind}.json"
     jsonl_path = out_dir / "trajectories.jsonl"
     if traj_path.exists():
         traj_path.unlink()
@@ -171,13 +174,16 @@ def _run_rpe_inprocess(ns: argparse.Namespace) -> None:
     for task_index in range(ns.start_index, ns.end_index):
         for trial in range(ns.num_trials):
             env = _make_env(task_index)
-            agent = RpeAgent(
+            agent_kwargs = dict(
                 tools_info=getattr(env, "tools_info", []) or [],
                 wiki=getattr(env, "wiki", "") or "",
                 model=ns.model,
                 provider=ns.model_provider,
                 temperature=float(ns.temperature),
             )
+            if agent_kind == "igrpe":
+                agent_kwargs["env_hint"] = ns.env
+            agent = _AgentCls(**agent_kwargs)
             try:
                 result = agent.solve(env, task_index=task_index, max_num_steps=ns.max_num_steps)
                 reward = float(getattr(result, "reward", 0.0) or 0.0)
@@ -211,7 +217,7 @@ def main() -> int:
     ns = _parse_args()
     ensure_dir(ns.output_dir)
 
-    agent_strategy = "tool-calling" if ns.agent == "baseline" else "rpe"
+    agent_strategy = {"baseline": "tool-calling", "rpe": "rpe", "igrpe": "igrpe"}.get(ns.agent, ns.agent)
     status = "ok"
     error: str = ""
     try:
@@ -221,7 +227,7 @@ def main() -> int:
                 status = "error"
                 error = f"tau-bench baseline subprocess exited with code {rc}"
         else:
-            _run_rpe_inprocess(ns)
+            _run_rpe_inprocess(ns, agent_kind=ns.agent)
     except Exception as exc:  # noqa: BLE001 — we want any failure recorded
         status = "error"
         error = f"{exc.__class__.__name__}: {exc}"

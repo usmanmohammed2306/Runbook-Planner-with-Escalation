@@ -43,7 +43,7 @@ ACE_REPO = REPO_ROOT / "external" / "ACEBench"
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser("ace_runner")
-    p.add_argument("--agent", required=True, choices=["baseline", "rpe"])
+    p.add_argument("--agent", required=True, choices=["baseline", "rpe", "igrpe"])
     p.add_argument("--model", required=True)
     p.add_argument("--language", default="en")
     p.add_argument("--limit", type=int, default=30)
@@ -416,7 +416,24 @@ def main() -> int:
         return 0
 
     client = get_client()
-    run_fn = _run_baseline if ns.agent == "baseline" else _run_rpe
+    if ns.agent == "baseline":
+        run_fn = _run_baseline
+    elif ns.agent == "rpe":
+        run_fn = _run_rpe
+    else:
+        from ..ig_rpe.ace_agent import run_igrpe as _igrpe_fn
+
+        def run_fn(client, model, task, max_num_steps, temperature):  # type: ignore[misc]
+            return _igrpe_fn(
+                client=client,
+                model=model,
+                task=task,
+                tool_specs=_extract_tool_specs(task),
+                user_turn=_extract_user_turn(task),
+                system_prompt=_system_prompt_baseline(task),
+                max_num_steps=max_num_steps,
+                temperature=temperature,
+            )
 
     records: List[Dict[str, Any]] = []
     for i, task in enumerate(tasks):
@@ -450,6 +467,8 @@ def main() -> int:
             "num_steps": sum(1 for m in res.get("messages", []) if m.get("role") == "assistant"),
             "messages": res.get("messages", []),
             "rpe_runbook_final": res.get("rpe_runbook_final"),
+            "igrpe_ledger_final": res.get("igrpe_ledger_final"),
+            "igrpe_gate_stats": res.get("igrpe_gate_stats"),
         }
         append_jsonl(traj_path, record)
         records.append(record)
