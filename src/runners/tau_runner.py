@@ -28,6 +28,18 @@ from typing import Any, Dict, List
 from ..common.io_utils import append_jsonl, ensure_dir, safe_mean, write_json
 
 
+def _try_install_litellm_patch() -> None:
+    """Best-effort: load the litellm-truncation sitecustomize hook in-process."""
+    try:
+        repo_root = Path(__file__).resolve().parents[2]
+        patch_dir = repo_root / "src" / "_taubench_patches"
+        if str(patch_dir) not in sys.path:
+            sys.path.insert(0, str(patch_dir))
+        import sitecustomize  # noqa: F401  (executes _install on import)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[tau_runner] litellm patch not loaded: {exc}", flush=True)
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser("tau_runner")
     p.add_argument("--env", required=True, choices=["retail", "airline"])
@@ -124,8 +136,15 @@ def _run_baseline_subprocess(ns: argparse.Namespace) -> int:
         "--max-concurrency", str(ns.max_concurrency),
         "--log-dir", os.path.abspath(ns.output_dir),
     ]
+    # Inject sitecustomize patch dir on PYTHONPATH so litellm.completion
+    # truncates oversized tool messages before they hit the vLLM context cap.
+    patch_dir = repo_root / "src" / "_taubench_patches"
+    env = os.environ.copy()
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (str(patch_dir) + (os.pathsep + existing if existing else ""))
     print(f"[tau_runner] subprocess: {' '.join(cmd)}", flush=True)
-    return subprocess.call(cmd, cwd=str(tau_dir))
+    print(f"[tau_runner] sitecustomize patch dir: {patch_dir}", flush=True)
+    return subprocess.call(cmd, cwd=str(tau_dir), env=env)
 
 
 def _run_rpe_inprocess(ns: argparse.Namespace, agent_kind: str = "rpe") -> None:
@@ -139,6 +158,11 @@ def _run_rpe_inprocess(ns: argparse.Namespace, agent_kind: str = "rpe") -> None:
     persist results in a tau-bench-compatible ``results.json`` shape so the
     summary builder works uniformly.
     """
+    # Load the litellm-truncation patch into the in-process run too, so the
+    # tau-bench user simulator (which calls litellm.completion under the hood)
+    # cannot blow the model's context window.
+    _try_install_litellm_patch()
+
     from tau_bench.envs import get_env  # type: ignore
 
     if agent_kind == "igrpe":
