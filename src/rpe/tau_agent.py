@@ -26,6 +26,17 @@ from .runbook import Runbook
 
 
 RESPOND_TOOL_NAME = "respond"
+RESPOND_MAX_CHARS = 800
+
+
+def _is_context_overflow(exc: BaseException) -> bool:
+    s = str(exc).lower()
+    return (
+        ("context" in s and "length" in s)
+        or "maximum context length" in s
+        or "contextwindowexceeded" in s
+        or exc.__class__.__name__ == "ContextWindowExceededError"
+    )
 
 
 class RpeAgent(Agent):
@@ -130,7 +141,14 @@ class RpeAgent(Agent):
                     except Exception:
                         kwargs = {}
                     action = Action(name=name, kwargs=kwargs)
-                    env_resp = env.step(action)
+                    try:
+                        env_resp = env.step(action)
+                    except Exception as env_exc:
+                        if _is_context_overflow(env_exc):
+                            step_error = f"env_step_context_overflow: {env_exc}"
+                            done = True
+                            break
+                        raise
                     tool_obs = _obs_text(env_resp)
                     messages.append({
                         "role": "tool",
@@ -154,9 +172,17 @@ class RpeAgent(Agent):
                 continue
 
             # No tool call — treat as a user-facing message via env.respond.
-            content = msg.content or ""
+            content = (msg.content or "").strip()
+            if len(content) > RESPOND_MAX_CHARS:
+                content = content[:RESPOND_MAX_CHARS] + " ..."
             action = Action(name=RESPOND_TOOL_NAME, kwargs={"content": content})
-            env_resp = env.step(action)
+            try:
+                env_resp = env.step(action)
+            except Exception as env_exc:
+                if _is_context_overflow(env_exc):
+                    step_error = f"env_respond_context_overflow: {env_exc}"
+                    break
+                raise
             user_reply = _obs_text(env_resp)
             if user_reply:
                 messages.append({"role": "user", "content": user_reply})

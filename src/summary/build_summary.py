@@ -1,4 +1,14 @@
-"""Aggregate per-run metrics.json files into outputs/summary/{summary.json,summary.md}."""
+"""Aggregate per-run metrics.json files into outputs/summary/{summary.json,summary.md}.
+
+Supports a 3-way comparison across three conditions on the same fixed base model:
+
+  1. baseline — vanilla tool-calling (tau-bench's reference path)
+  2. rpe      — lightweight Runbook Planner with Escalation
+  3. igrpe    — Invariant-Gated RPE (new): deterministic gate + symbolic ledger
+
+Each section renders rows for all available conditions; missing runs are
+reported as ``status=missing`` without breaking the table.
+"""
 from __future__ import annotations
 
 import argparse
@@ -6,16 +16,36 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..common.io_utils import read_json, write_json
 
 
-SECTIONS = [
-    ("tau-bench retail",  "tau_retail_baseline",       "tau_retail_rpe"),
-    ("tau-bench airline", "tau_airline_baseline",      "tau_airline_rpe"),
-    ("ACEBench Agent",    "acebench_agent_baseline",   "acebench_agent_rpe"),
+# (section_label, {condition: subdir})
+SECTIONS: List[Tuple[str, Dict[str, str]]] = [
+    ("tau-bench retail", {
+        "baseline": "tau_retail_baseline",
+        "rpe": "tau_retail_rpe",
+        "igrpe": "tau_retail_igrpe",
+    }),
+    ("tau-bench airline", {
+        "baseline": "tau_airline_baseline",
+        "rpe": "tau_airline_rpe",
+        "igrpe": "tau_airline_igrpe",
+    }),
+    ("ACEBench Agent", {
+        "baseline": "acebench_agent_baseline",
+        "rpe": "acebench_agent_rpe",
+        "igrpe": "acebench_agent_igrpe",
+    }),
 ]
+
+CONDITIONS: List[str] = ["baseline", "rpe", "igrpe"]
+CONDITION_LABELS: Dict[str, str] = {
+    "baseline": "Baseline",
+    "rpe": "RPE",
+    "igrpe": "IG-RPE",
+}
 
 
 def _parse_args() -> argparse.Namespace:
@@ -56,28 +86,50 @@ def _num(x: Any, digits: int = 2) -> str:
         return "n/a"
 
 
-def _fmt_tau_row(label: str, baseline: Dict[str, Any], rpe: Dict[str, Any]) -> List[str]:
-    bm = baseline.get("metrics", {}) or {}
-    rm = rpe.get("metrics", {}) or {}
-    return [
-        f"| {label} | success rate | {_pct(bm.get('success_rate'))} | {_pct(rm.get('success_rate'))} |",
-        f"| {label} | avg reward | {_num(bm.get('avg_reward'))} | {_num(rm.get('avg_reward'))} |",
-        f"| {label} | tasks | {bm.get('num_tasks', 'n/a')} | {rm.get('num_tasks', 'n/a')} |",
-        f"| {label} | status | {baseline.get('status', 'n/a')} | {rpe.get('status', 'n/a')} |",
-    ]
+def _tau_rows(label: str, by_cond: Dict[str, Dict[str, Any]]) -> List[str]:
+    def cell(cond: str, key: str, fmt) -> str:
+        metrics = (by_cond.get(cond, {}) or {}).get("metrics", {}) or {}
+        return fmt(metrics.get(key))
+    header = f"| {label} | Metric | " + " | ".join(CONDITION_LABELS[c] for c in CONDITIONS) + " |"
+    sep = "|" + "|".join(["---"] * (2 + len(CONDITIONS))) + "|"
+    rows: List[str] = []
+    for key, human, fmt in [
+        ("success_rate", "success rate", _pct),
+        ("avg_reward", "avg reward", _num),
+        ("num_tasks", "tasks", lambda x: str(x) if x is not None else "n/a"),
+        ("error_tasks", "error tasks", lambda x: str(x) if x is not None else "n/a"),
+        ("avg_trajectory_messages", "avg traj msgs", _num),
+    ]:
+        row = f"| {label} | {human} | " + " | ".join(cell(c, key, fmt) for c in CONDITIONS) + " |"
+        rows.append(row)
+    status_row = f"| {label} | status | " + " | ".join(
+        str((by_cond.get(c) or {}).get("status", "n/a")) for c in CONDITIONS
+    ) + " |"
+    rows.append(status_row)
+    return [header, sep] + rows
 
 
-def _fmt_ace_row(label: str, baseline: Dict[str, Any], rpe: Dict[str, Any]) -> List[str]:
-    bm = baseline.get("metrics", {}) or {}
-    rm = rpe.get("metrics", {}) or {}
-    return [
-        f"| {label} | completion rate | {_pct(bm.get('completion_rate'))} | {_pct(rm.get('completion_rate'))} |",
-        f"| {label} | tool-name coverage | {_pct(bm.get('tool_name_coverage'))} | {_pct(rm.get('tool_name_coverage'))} |",
-        f"| {label} | avg tool calls | {_num(bm.get('avg_tool_calls'))} | {_num(rm.get('avg_tool_calls'))} |",
-        f"| {label} | avg steps | {_num(bm.get('avg_steps'))} | {_num(rm.get('avg_steps'))} |",
-        f"| {label} | tasks | {bm.get('num_tasks', 'n/a')} | {rm.get('num_tasks', 'n/a')} |",
-        f"| {label} | status | {baseline.get('status', 'n/a')} | {rpe.get('status', 'n/a')} |",
-    ]
+def _ace_rows(label: str, by_cond: Dict[str, Dict[str, Any]]) -> List[str]:
+    def cell(cond: str, key: str, fmt) -> str:
+        metrics = (by_cond.get(cond, {}) or {}).get("metrics", {}) or {}
+        return fmt(metrics.get(key))
+    header = f"| {label} | Metric | " + " | ".join(CONDITION_LABELS[c] for c in CONDITIONS) + " |"
+    sep = "|" + "|".join(["---"] * (2 + len(CONDITIONS))) + "|"
+    rows: List[str] = []
+    for key, human, fmt in [
+        ("completion_rate", "completion rate", _pct),
+        ("tool_name_coverage", "tool-name coverage", _pct),
+        ("avg_tool_calls", "avg tool calls", _num),
+        ("avg_steps", "avg steps", _num),
+        ("num_tasks", "tasks", lambda x: str(x) if x is not None else "n/a"),
+    ]:
+        row = f"| {label} | {human} | " + " | ".join(cell(c, key, fmt) for c in CONDITIONS) + " |"
+        rows.append(row)
+    status_row = f"| {label} | status | " + " | ".join(
+        str((by_cond.get(c) or {}).get("status", "n/a")) for c in CONDITIONS
+    ) + " |"
+    rows.append(status_row)
+    return [header, sep] + rows
 
 
 def build(outputs_dir: Path, active_model: str, served_name: str) -> Dict[str, Any]:
@@ -93,54 +145,51 @@ def build(outputs_dir: Path, active_model: str, served_name: str) -> Dict[str, A
         "served_name": served_name,
         "sections": [],
     }
-    for label, base_dir, rpe_dir in SECTIONS:
-        b = _load(outputs_dir, base_dir)
-        r = _load(outputs_dir, rpe_dir)
-        summary["sections"].append({
-            "label": label,
-            "baseline": b,
-            "rpe": r,
-        })
+    for label, subdirs in SECTIONS:
+        by_cond = {cond: _load(outputs_dir, subdirs[cond]) for cond in CONDITIONS if cond in subdirs}
+        summary["sections"].append({"label": label, "by_condition": by_cond})
     return summary
 
 
 def render_markdown(summary: Dict[str, Any]) -> str:
     lines: List[str] = []
-    lines.append("# RPE vs Baseline — Comparison Summary")
+    lines.append("# Baseline vs RPE vs IG-RPE — Comparison Summary")
     lines.append("")
     lines.append(f"- Active model: `{summary.get('active_model') or '(unknown)'}`")
     lines.append(f"- Served name:  `{summary.get('served_name') or '(unknown)'}`")
     lines.append("")
-    lines.append("The same fixed base model is used for both baseline (vanilla tool-calling) "
-                 "and RPE (lightweight Runbook Planner with Escalation).")
+    lines.append(
+        "Same fixed base model across all three conditions. Baseline = vanilla "
+        "tool-calling. RPE = runbook planner with an LLM supervisor. IG-RPE = "
+        "invariant-gated tool-calling with a symbolic ledger (this project's "
+        "contribution)."
+    )
     lines.append("")
     lines.append("## Results")
     lines.append("")
-    lines.append("| Section | Metric | Baseline | RPE |")
-    lines.append("|---|---|---|---|")
     for section in summary["sections"]:
         label = section["label"]
-        baseline = section["baseline"]
-        rpe = section["rpe"]
+        by_cond = section["by_condition"]
+        lines.append(f"### {label}")
         if label.startswith("tau"):
-            lines.extend(_fmt_tau_row(label, baseline, rpe))
+            lines.extend(_tau_rows(label, by_cond))
         else:
-            lines.extend(_fmt_ace_row(label, baseline, rpe))
-    lines.append("")
+            lines.extend(_ace_rows(label, by_cond))
+        lines.append("")
     lines.append("## Notes")
     lines.append("")
     for section in summary["sections"]:
-        for key in ("baseline", "rpe"):
-            note = section[key].get("note")
+        for cond in CONDITIONS:
+            data = (section.get("by_condition") or {}).get(cond) or {}
+            note = data.get("note")
             if note:
-                lines.append(f"- **{section['label']} / {key}**: {note}")
+                lines.append(f"- **{section['label']} / {CONDITION_LABELS[cond]}**: {note}")
     lines.append("")
-    lines.append("## Caveats")
-    lines.append("- tau-bench metrics come from the upstream per-trial JSON files parsed by our runner.")
-    lines.append("- ACEBench metrics in this summary are *internal diagnostic signals* (completion rate, tool-name coverage).")
-    lines.append("  For the official ACEBench score, re-run upstream `score_agent.py` against the saved trajectories.")
-    lines.append("- RPE adds two extra LLM calls per turn (planner up-front + decide after each observation);")
-    lines.append("  wall-clock time and token usage will be higher than baseline even at matched task counts.")
+    lines.append("## Method notes")
+    lines.append("- Baseline uses tau-bench's upstream `tool-calling` agent; metrics parsed from its per-trial JSON.")
+    lines.append("- RPE adds a compact runbook + per-turn supervisor; two extra LLM calls per step.")
+    lines.append("- IG-RPE adds zero LLM calls on READ paths and at most one retry on a blocked WRITE; the gate is deterministic.")
+    lines.append("- ACEBench metrics are internal diagnostic signals (completion rate, tool-name coverage). For the official score, re-run upstream `score_agent.py` against the saved trajectories.")
     return "\n".join(lines) + "\n"
 
 
