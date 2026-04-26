@@ -1,7 +1,7 @@
-"""Patch vLLM source to fix RuntimeError: Already borrowed.
+"""Patch vLLM source to fix RuntimeError: Already borrowed and JSONDecodeError.
 
-Root cause
-----------
+Root cause 1 — RuntimeError: Already borrowed
+----------------------------------------------
 vLLM creates a **new** tool-parser instance for every chat-completion request.
 Each instantiation calls ``tokenizer.encode()`` to resolve special-token IDs.
 The HuggingFace fast tokenizer (backed by the Rust ``tokenizers`` crate) uses a
@@ -14,8 +14,14 @@ require a *mutable* borrow, but vLLM's async engine may already hold a borrow
 The bug appears at max-concurrency ≥ 1 because even a single request triggers
 both the engine borrow and the parser-init borrow before the first one releases.
 
-Two-pronged fix (idempotent — safe to apply multiple times)
------------------------------------------------------------
+Root cause 2 — JSONDecodeError: Extra data
+------------------------------------------
+Qwen2.5-7B-Instruct (and other models) sometimes generates valid JSON followed
+by extra text inside the ``<tool_call>`` block.  ``json.loads()`` rejects the
+entire string with ``JSONDecodeError: Extra data``.
+
+Three-pronged fix (idempotent — safe to apply multiple times)
+-------------------------------------------------------------
 1. **Tool parsers** (hermes, mistral, llama3_json, …): wrap every
    ``self.model_tokenizer.encode(...)`` call in a ``threading.Lock`` with a
    short exponential-backoff retry loop so the call waits for the other borrow
@@ -24,6 +30,10 @@ Two-pronged fix (idempotent — safe to apply multiple times)
 2. **engine/serving.py**: add a retry loop around ``tool_parser_cls(tokenizer)``
    itself, because errors can also surface there when the parser's ``__init__``
    calls encode indirectly.
+
+3. **hermes_tool_parser.py** ``extract_tool_calls``: replace ``json.loads()``
+   with a ``raw_decode()``-based helper that stops at the end of the first valid
+   JSON object and silently discards any trailing content.
 
 Usage (from run_project.sh)
 ---------------------------
@@ -36,6 +46,7 @@ import sys
 from pathlib import Path
 
 MARKER = "# _SAGE_BORROW_FIX_APPLIED"
+MARKER_JSON = "# _SAGE_JSON_FIX_APPLIED"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -142,6 +153,56 @@ def patch_serving(path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Patch 3: hermes_tool_parser.py — tolerate trailing content after JSON
+# ---------------------------------------------------------------------------
+
+# Helper injected at module level in hermes_tool_parser.py.
+_JSON_HELPER_BLOCK = """\
+
+{marker}
+import json as _sage_json_mod
+
+
+def _sage_json_load(s):
+    \"\"\"Parse the first valid JSON object from *s*, ignoring trailing content.\"\"\"
+    s = (s or "").strip()
+    try:
+        obj, _ = _sage_json_mod.JSONDecoder().raw_decode(s)
+        return obj
+    except _sage_json_mod.JSONDecodeError:
+        return _sage_json_mod.loads(s)
+
+""".format(marker=MARKER_JSON)
+
+# Patterns: json.loads(match[0] if match[0] else match[1])
+# and similar single-argument json.loads() calls inside extract_tool_calls.
+# We replace every occurrence of json.loads( that follows the hermes regex
+# match variable with _sage_json_load( — the helper is module-level so
+# it's always in scope.
+_JSON_LOADS_PATTERN = re.compile(
+    r"\bjson\.loads\(\s*(match\[(?:0|1)\](?:\s+if\s+match\[(?:0|1)\]\s+else\s+match\[(?:0|1)\])?)\s*\)"
+)
+
+
+def patch_json_loads(path: Path) -> None:
+    src = path.read_text(encoding="utf-8")
+    if MARKER_JSON in src:
+        print(f"  skip (already patched json): {path.name}")
+        return
+
+    new_src, count = _JSON_LOADS_PATTERN.subn(
+        lambda m: f"_sage_json_load({m.group(1)})", src
+    )
+    if count == 0:
+        print(f"  skip (json.loads pattern not found): {path.name}")
+        return
+
+    new_src = _insert_after_imports(new_src, _JSON_HELPER_BLOCK)
+    path.write_text(new_src, encoding="utf-8")
+    print(f"  patched json.loads→_sage_json_load: {path.name} ({count} site(s))")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -180,6 +241,11 @@ def main() -> None:
             p = parsers_dir / name
             if p.exists():
                 patch_tool_parser(p)
+        # JSON fix only needed for hermes (the only parser that calls json.loads
+        # on raw regex match groups).
+        hermes = parsers_dir / "hermes_tool_parser.py"
+        if hermes.exists():
+            patch_json_loads(hermes)
     else:
         print(f"  tool_parsers dir not found: {parsers_dir}")
 
