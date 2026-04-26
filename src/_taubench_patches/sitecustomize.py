@@ -26,8 +26,16 @@ import os
 import sys
 
 MAX_TOOL_CHARS = int(os.environ.get("TAU_PATCH_MAX_TOOL_CHARS", "3000"))
-SOFT_TOTAL_CHAR_BUDGET = int(os.environ.get("TAU_PATCH_SOFT_BUDGET", "40000"))
-HARD_TOTAL_CHAR_BUDGET = int(os.environ.get("TAU_PATCH_HARD_BUDGET", "26000"))
+# Soft budget: only truncate individual oversized messages below this total.
+# Hard budget: iteratively shrink until content fits (must leave headroom for
+# tool schemas + system prompt + decode).  Tau-retail ships ~20 tool specs at
+# ~6 000 tokens; at 1.5 chars/token that is ~9 000 chars NOT in the message
+# content.  With a 16 384-token model:
+#   available_content_tokens ≈ 16384 - 6000 (tools) - 1500 (system) - 1500 (decode)
+#                            = 7384 tokens × 1.75 chars/token ≈ 12 922 chars
+# We use 12 000 as the default to give a comfortable buffer.
+SOFT_TOTAL_CHAR_BUDGET = int(os.environ.get("TAU_PATCH_SOFT_BUDGET", "20000"))
+HARD_TOTAL_CHAR_BUDGET = int(os.environ.get("TAU_PATCH_HARD_BUDGET", "12000"))
 KEEP_SYSTEM_FULL = True
 
 
@@ -65,30 +73,43 @@ def _shrink_pass(messages, recent_cap: int, old_cap: int, recent_keep: int):
     return out
 
 
-def _shrink_messages(messages):
+def _shrink_messages(messages, extra_chars: int = 0):
     """Iteratively shrink until under the hard budget.
+
+    Parameters
+    ----------
+    messages : list
+        Chat message dicts to shrink.
+    extra_chars : int
+        Additional chars already "spent" by content outside the message list
+        (e.g. the serialised ``tools`` JSON passed to the API).  This is
+        subtracted from both budgets so the caller does not need to know about
+        the internal thresholds.
 
     Strategy
     --------
-    1. If total content is under the soft budget, only cap individual oversized
-       tool/user observations (a single 200 KB JSON blob must always be cut).
-    2. Otherwise, run a normal truncation pass: last 6 messages full
-       ``MAX_TOOL_CHARS`` each, older capped to ``MAX_TOOL_CHARS // 5``.
-    3. If the result is still over the hard budget (long trajectories with many
-       recent tool observations), run an aggressive pass: last 4 messages
-       capped at ``MAX_TOOL_CHARS // 2``, older capped at 400 chars.
-    4. As a last-resort guard, run an extreme pass: last 3 messages at 1000
-       chars, everything else at 250.
+    1. If total content is under the *effective* soft budget, only cap
+       individual oversized tool/user observations.
+    2. Normal pass: last 6 messages at ``MAX_TOOL_CHARS``, older at
+       ``MAX_TOOL_CHARS // 5``.
+    3. Aggressive pass: last 4 messages at ``MAX_TOOL_CHARS // 2``, older at
+       300 chars.
+    4. Last-resort: last 3 messages at 800 chars, everything else at 150.
+    5. Extreme guard: keep system + last 2 messages at 400 chars each.
 
-    The hard budget defaults to 32 K chars ≈ ~10 K tokens at tau-bench's
-    JSON-heavy density, leaving headroom under the 16 K-token model context
-    for the system prompt + tool schemas (~3 K tokens) and decode (~1.5 K).
+    The hard budget is sized so that message content + tool schemas + system
+    prompt + decode stay under the model's 16 384-token limit.
     """
     if not isinstance(messages, list) or not messages:
         return messages
 
+    # Clamp extra_chars to avoid negative budgets on very large tool schemas.
+    extra = max(0, int(extra_chars))
+    soft = max(3000, SOFT_TOTAL_CHAR_BUDGET - extra)
+    hard = max(2000, HARD_TOTAL_CHAR_BUDGET - extra)
+
     total = _total_content_chars(messages)
-    if total <= SOFT_TOTAL_CHAR_BUDGET:
+    if total <= soft:
         out = []
         for m in messages:
             if not isinstance(m, dict):
@@ -100,18 +121,23 @@ def _shrink_messages(messages):
             out.append(m)
         return out
 
-    old_cap_normal = max(400, MAX_TOOL_CHARS // 5)
+    old_cap_normal = max(300, MAX_TOOL_CHARS // 5)
     out = _shrink_pass(messages, recent_cap=MAX_TOOL_CHARS, old_cap=old_cap_normal, recent_keep=6)
-    if _total_content_chars(out) <= HARD_TOTAL_CHAR_BUDGET:
+    if _total_content_chars(out) <= hard:
         return out
 
-    aggressive_recent = max(800, MAX_TOOL_CHARS // 2)
-    out = _shrink_pass(out, recent_cap=aggressive_recent, old_cap=400, recent_keep=4)
-    if _total_content_chars(out) <= HARD_TOTAL_CHAR_BUDGET:
+    aggressive_recent = max(600, MAX_TOOL_CHARS // 2)
+    out = _shrink_pass(out, recent_cap=aggressive_recent, old_cap=300, recent_keep=4)
+    if _total_content_chars(out) <= hard:
         return out
 
     # Last-resort: floor everything.
-    out = _shrink_pass(out, recent_cap=1000, old_cap=250, recent_keep=3)
+    out = _shrink_pass(out, recent_cap=800, old_cap=150, recent_keep=3)
+    if _total_content_chars(out) <= hard:
+        return out
+
+    # Extreme guard: keep system + last 2 assistant+tool pairs only.
+    out = _shrink_pass(out, recent_cap=400, old_cap=80, recent_keep=2)
     return out
 
 

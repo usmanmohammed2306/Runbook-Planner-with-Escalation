@@ -16,6 +16,7 @@ Adds two pragmatic safeguards that the bare ``OpenAI`` client doesn't have:
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 from pathlib import Path
@@ -55,6 +56,16 @@ def _load_shrink_helper():
         return None
 
 
+def _tools_chars(tools: Any) -> int:
+    """Estimate the char footprint of the tools JSON sent to the API."""
+    if not tools:
+        return 0
+    try:
+        return len(json.dumps(tools, ensure_ascii=False))
+    except Exception:
+        return 0
+
+
 def _wrap_create(real_create):
     shrink = _load_shrink_helper()
     if shrink is None:
@@ -64,7 +75,12 @@ def _wrap_create(real_create):
         try:
             msgs = kwargs.get("messages")
             if msgs is not None:
-                kwargs["messages"] = shrink(msgs)
+                # Pass the tools JSON size so _shrink_messages can reduce its
+                # effective budget accordingly.  This prevents overflows caused
+                # by large tool schemas (tau-retail ships ~20 specs at ~6K
+                # tokens) that are NOT counted in the message content chars.
+                extra = _tools_chars(kwargs.get("tools"))
+                kwargs["messages"] = shrink(msgs, extra_chars=extra)
         except Exception as exc:
             print(f"[openai_client] truncation skipped: {exc}", file=sys.stderr)
         return real_create(*args, **kwargs)

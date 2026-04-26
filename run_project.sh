@@ -153,15 +153,25 @@ FALLBACK2_IMPL="transformers"; FALLBACK2_MAX_LEN="8192";  FALLBACK2_MEM_UTIL="0.
 # the patch's iterative shrink: if a normal pass leaves the prompt over
 # HARD_BUDGET chars, the patch keeps shrinking until it fits.
 #
-# Soft=40K means most short trajectories pass through unmodified (preserving
-# the JSON detail the agent needs to pick correct item_ids). Hard=26K caps
-# the prompt to ~10K input tokens at JSON density (3 chars/token), leaving
-# headroom under the 16K-token model context for tool schemas (~3K tokens)
-# and decode (~1.5K). Last-resort floor inside sitecustomize.py shrinks
-# old observations to 250 chars while keeping the most recent 3 readable.
-export TAU_PATCH_MAX_TOOL_CHARS="${TAU_PATCH_MAX_TOOL_CHARS:-3000}"
-export TAU_PATCH_SOFT_BUDGET="${TAU_PATCH_SOFT_BUDGET:-40000}"
-export TAU_PATCH_HARD_BUDGET="${TAU_PATCH_HARD_BUDGET:-26000}"
+# Truncation budget calibration for a 16 384-token model context.
+#
+# Token accounting (rough, tau-retail worst case):
+#   ~20 tool specs                → ~6 000 tokens  (~10 500 chars at JSON density)
+#   system prompt (SAGE block+wiki) → ~1 500 tokens  (~ 2 500 chars)
+#   decode headroom               → ~1 500 tokens
+#   -----------------------------------------
+#   available for message content → ~7 384 tokens
+#   at 1.75 chars/token           → ~12 900 chars
+#
+# openai_client.py passes the tools JSON length as extra_chars to
+# _shrink_messages, which subtracts it from the budgets.  The defaults
+# below are therefore the *base* content budget (excluding tools).
+#
+# Soft budget: start truncating individual oversized observations.
+# Hard budget: shrink iteratively until this is met.
+export TAU_PATCH_MAX_TOOL_CHARS="${TAU_PATCH_MAX_TOOL_CHARS:-2000}"
+export TAU_PATCH_SOFT_BUDGET="${TAU_PATCH_SOFT_BUDGET:-20000}"
+export TAU_PATCH_HARD_BUDGET="${TAU_PATCH_HARD_BUDGET:-12000}"
 
 # Qwen2.5-7B first — stable 32K context, best tool-calling quality at this size.
 MODEL_CANDIDATES=(
