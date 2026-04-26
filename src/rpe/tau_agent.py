@@ -50,7 +50,7 @@ class RpeAgent(Agent):
         provider: str = "openai",
         temperature: float = 0.0,
         max_escalations: int = 2,
-        replan_every_steps: int = 1,
+        replan_every_steps: int = 3,
     ) -> None:
         self.tools_info = tools_info or []
         self.wiki = wiki or ""
