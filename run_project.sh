@@ -169,27 +169,27 @@ MODEL_CANDIDATES=(
   "Qwen/Qwen3-4B-Instruct-2507"
 )
 
-# Sized to fit the 12-condition pipeline (4 controllers × 3 benchmarks)
-# under ~5 h on a single A100 with --enforce-eager. Override via env vars
-# for a longer/shorter sweep.
+# Sized to fit the 12-condition pipeline (4 controllers × 3 benchmarks) with
+# 3 trials per task on a single A100 with --enforce-eager. Override via env
+# vars for a different scope.
 #
 # Wall-clock estimate (eager-mode Qwen2.5-7B at ~5 s/LLM-call):
-#   tau-bench:  10 tasks × 1 trial × 2 envs × 4 controllers = 80 trajs
-#               avg ~22 LLM calls/traj  →  80 × 22 × 5 = 8800 s ≈ 2.45 h
-#   ACEBench:   15 tasks × 4 controllers = 60 trajs
-#               avg ~10 LLM calls/traj  →  60 × 10 × 5 = 3000 s ≈ 0.83 h
+#   tau-bench:  15 tasks × 3 trials × 2 envs × 4 controllers = 360 trajs
+#               avg ~22 LLM calls/traj  →  360 × 22 × 5 = 39600 s ≈ 11 h
+#   ACEBench:   20 tasks × 4 controllers = 80 trajs
+#               avg ~10 LLM calls/traj  →  80 × 10 × 5 = 4000 s ≈ 1.1 h
 #   vLLM start + summary: ~0.3 h
-#   Total: ~3.6 h, with ~1.5 h buffer for slow/long tasks → fits <5 h.
+#   Total: ~12.4 h. For faster iteration, set TAU_NUM_TRIALS=1 or TAU_END_INDEX=8.
 TAU_TASK_SPLIT="${TAU_TASK_SPLIT:-test}"
 TAU_START_INDEX="${TAU_START_INDEX:-0}"
-TAU_END_INDEX="${TAU_END_INDEX:-10}"
-TAU_NUM_TRIALS="${TAU_NUM_TRIALS:-1}"
+TAU_END_INDEX="${TAU_END_INDEX:-15}"
+TAU_NUM_TRIALS="${TAU_NUM_TRIALS:-3}"
 TAU_MAX_CONCURRENCY="${TAU_MAX_CONCURRENCY:-1}"
 TAU_TEMPERATURE="${TAU_TEMPERATURE:-0.0}"
 TAU_MAX_STEPS="${TAU_MAX_STEPS:-30}"
 
-ACE_LIMIT="${ACE_LIMIT:-15}"
-ACE_MAX_STEPS="${ACE_MAX_STEPS:-15}"
+ACE_LIMIT="${ACE_LIMIT:-20}"
+ACE_MAX_STEPS="${ACE_MAX_STEPS:-20}"
 ACE_LANGUAGE="${ACE_LANGUAGE:-en}"
 
 # OpenAI SDK timeout for direct in-process calls. 60 s is enough for any
