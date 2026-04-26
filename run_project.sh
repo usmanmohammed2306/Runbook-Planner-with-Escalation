@@ -123,17 +123,21 @@ export VLLM_ENGINE_READY_TIMEOUT_S="$VLLM_READY_TIMEOUT"
 VLLM_COMPILATION_CONFIG='{"mode":0,"custom_ops":["none"],"pass_config":{"fuse_norm_quant":false,"fuse_act_quant":false,"fuse_attn_quant":false}}'
 
 # Primary + fallback (max_model_len, gpu_memory_utilization, model-impl, eager).
-# Rung 1 (FAST): CUDA graphs ON — ~2-3x faster decode than eager. If CUDA-graph
-#   capture OOMs at startup or the kernel fails, we automatically drop to rung 2
-#   which is the previous known-good eager config.
-# Rung 2 (SAFE): eager mode at the same context — guaranteed to work since this
-#   was the previously-shipped primary configuration.
-# Rung 3/4: progressively shrink context, finally fall back to transformers backend.
-# Override: set ENFORCE_EAGER=1 to skip rung 1 and go straight to rung 2.
+# Rung 1 (eager, primary context):  the known-good config. Default.
+# Rung 2 (eager, smaller context):  for OOM at primary context.
+# Rung 3 (transformers backend):    last-resort path with no CUDA-graph deps.
+#
+# Why not try CUDA graphs first?
+#   We pin compilation_config.mode=0 (NO_COMPILATION) for stability. vLLM 0.18
+#   then auto-overrides cudagraph_mode -> NONE anyway, so dropping
+#   --enforce-eager gains zero speed but routes through a different warmup
+#   path (_dummy_run) that hits cudaErrorNoKernelImageForDevice in FlashAttn
+#   on cu130 builds. Net: eager is strictly the safe and equivalent choice.
+#   Set ENFORCE_EAGER=0 to opt back into the experimental fast rung.
 PRIMARY_MAX_LEN="${MAX_MODEL_LEN:-16384}"
 PRIMARY_MEM_UTIL="${GPU_MEM_UTIL:-0.80}"
 PRIMARY_IMPL="${MODEL_IMPL:-auto}"
-ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
+ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
 FALLBACK1_IMPL="auto";         FALLBACK1_MAX_LEN="12288"; FALLBACK1_MEM_UTIL="0.75"
 FALLBACK2_IMPL="transformers"; FALLBACK2_MAX_LEN="8192";  FALLBACK2_MEM_UTIL="0.65"
 
