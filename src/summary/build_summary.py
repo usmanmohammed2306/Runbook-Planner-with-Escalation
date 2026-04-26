@@ -5,14 +5,15 @@ Renders a four-way comparison across the same fixed base model:
   1. baseline — vanilla tool-calling (minimal system prompt)
   2. act      — Act (Yao et al. 2022): action-only, no reasoning prose
   3. react    — ReAct (Yao et al. 2022): one-line Thought before each Action
-  4. igrpe    — Invariant-Gated RPE (this project's contribution): deterministic
-                pre-write gate over a symbolic ledger
+  4. sage     — Schema-Anchored Grounded Execution (this project's
+                contribution): deterministic gate enforcing schema +
+                provenance + idempotency on every proposed tool call
 
 Each section renders a row per metric for all four conditions. Missing runs
 are reported as ``status=missing`` so the table never collapses on partial
 data.
 
-The summary also computes a ``deltas`` block per benchmark — IG-RPE minus the
+The summary also computes a ``deltas`` block per benchmark — SAGE minus the
 strongest baseline on the headline metric (success rate for tau-bench,
 completion rate for ACEBench) — to make the wins immediately visible.
 """
@@ -33,28 +34,28 @@ SECTIONS: List[Tuple[str, Dict[str, str]]] = [
         "baseline": "tau_retail_baseline",
         "act": "tau_retail_act",
         "react": "tau_retail_react",
-        "igrpe": "tau_retail_igrpe",
+        "sage": "tau_retail_sage",
     }),
     ("tau-bench airline", {
         "baseline": "tau_airline_baseline",
         "act": "tau_airline_act",
         "react": "tau_airline_react",
-        "igrpe": "tau_airline_igrpe",
+        "sage": "tau_airline_sage",
     }),
     ("ACEBench Agent", {
         "baseline": "acebench_agent_baseline",
         "act": "acebench_agent_act",
         "react": "acebench_agent_react",
-        "igrpe": "acebench_agent_igrpe",
+        "sage": "acebench_agent_sage",
     }),
 ]
 
-CONDITIONS: List[str] = ["baseline", "act", "react", "igrpe"]
+CONDITIONS: List[str] = ["baseline", "act", "react", "sage"]
 CONDITION_LABELS: Dict[str, str] = {
     "baseline": "Vanilla TC",
     "act": "Act",
     "react": "ReAct",
-    "igrpe": "IG-RPE (ours)",
+    "sage": "SAGE (ours)",
 }
 
 
@@ -139,7 +140,7 @@ def _headline_metric_key(label: str) -> str:
 
 
 def _strongest_baseline(by_cond: Dict[str, Dict[str, Any]], key: str) -> Tuple[Optional[str], Optional[float]]:
-    """Return (condition_name, value) for the best non-IG-RPE controller on ``key``."""
+    """Return (condition_name, value) for the best non-SAGE controller on ``key``."""
     best_cond: Optional[str] = None
     best_val: Optional[float] = None
     for c in ("baseline", "act", "react"):
@@ -177,21 +178,21 @@ def build(outputs_dir: Path, active_model: str, served_name: str) -> Dict[str, A
 
         key = _headline_metric_key(label)
         best_cond, best_val = _strongest_baseline(by_cond, key)
-        igrpe_metrics = (by_cond.get("igrpe", {}) or {}).get("metrics", {}) or {}
-        igrpe_val = igrpe_metrics.get(key)
+        sage_metrics = (by_cond.get("sage", {}) or {}).get("metrics", {}) or {}
+        sage_val = sage_metrics.get(key)
         try:
-            igrpe_val_f = float(igrpe_val) if igrpe_val is not None else None
+            sage_val_f = float(sage_val) if sage_val is not None else None
         except Exception:
-            igrpe_val_f = None
+            sage_val_f = None
         delta: Dict[str, Any] = {
             "section": label,
             "metric": key,
             "best_baseline": best_cond,
             "best_baseline_value": best_val,
-            "igrpe_value": igrpe_val_f,
+            "sage_value": sage_val_f,
             "delta_vs_best_baseline": (
-                igrpe_val_f - best_val
-                if igrpe_val_f is not None and best_val is not None
+                sage_val_f - best_val
+                if sage_val_f is not None and best_val is not None
                 else None
             ),
         }
@@ -201,7 +202,7 @@ def build(outputs_dir: Path, active_model: str, served_name: str) -> Dict[str, A
 
 def render_markdown(summary: Dict[str, Any]) -> str:
     lines: List[str] = []
-    lines.append("# Vanilla / Act / ReAct / IG-RPE — Comparison Summary")
+    lines.append("# Vanilla / Act / ReAct / SAGE — Comparison Summary")
     lines.append("")
     lines.append(f"- Active model: `{summary.get('active_model') or '(unknown)'}`")
     lines.append(f"- Served name:  `{summary.get('served_name') or '(unknown)'}`")
@@ -211,30 +212,31 @@ def render_markdown(summary: Dict[str, Any]) -> str:
         "Vanilla TC = minimal system prompt with native function-calling. "
         "Act = action-only, no reasoning prose (Yao et al. 2022). "
         "ReAct = one-line Thought before each Action (Yao et al. 2022). "
-        "IG-RPE = invariant-gated tool-calling with a deterministic symbolic "
-        "ledger (this project's contribution)."
+        "SAGE = Schema-Anchored Grounded Execution: a deterministic gate "
+        "enforcing JSONSchema validation, identifier-argument provenance, and "
+        "idempotency on every proposed tool call (this project's contribution)."
     )
     lines.append("")
-    lines.append("## Headline deltas (IG-RPE vs. best of vanilla / Act / ReAct)")
+    lines.append("## Headline deltas (SAGE vs. best of vanilla / Act / ReAct)")
     lines.append("")
-    lines.append("| Benchmark | Metric | Best baseline | Best baseline value | IG-RPE | Δ |")
+    lines.append("| Benchmark | Metric | Best baseline | Best baseline value | SAGE | Δ |")
     lines.append("|---|---|---|---|---|---|")
     for d in summary.get("deltas", []):
         bb = d.get("best_baseline") or "n/a"
         bb_label = CONDITION_LABELS.get(bb, bb)
         bbv = d.get("best_baseline_value")
-        igv = d.get("igrpe_value")
+        sgv = d.get("sage_value")
         dv = d.get("delta_vs_best_baseline")
         is_pct_metric = d.get("metric") in ("success_rate", "completion_rate", "tool_name_coverage")
         bbv_s = _pct(bbv) if is_pct_metric else _num(bbv)
-        igv_s = _pct(igv) if is_pct_metric else _num(igv)
+        sgv_s = _pct(sgv) if is_pct_metric else _num(sgv)
         if dv is None:
             dv_s = "n/a"
         elif is_pct_metric:
             dv_s = f"{100.0 * dv:+.1f} pp"
         else:
             dv_s = f"{dv:+.2f}"
-        lines.append(f"| {d.get('section')} | {d.get('metric')} | {bb_label} | {bbv_s} | {igv_s} | {dv_s} |")
+        lines.append(f"| {d.get('section')} | {d.get('metric')} | {bb_label} | {bbv_s} | {sgv_s} | {dv_s} |")
     lines.append("")
     lines.append("## Per-benchmark detail")
     lines.append("")
@@ -260,18 +262,21 @@ def render_markdown(summary: Dict[str, Any]) -> str:
     lines.append("- All four controllers share the SAME in-process tool-calling loop "
                  "(same model, same tools, same temperature, same max-steps, same "
                  "truncation budget). The only thing that varies is the system "
-                 "prompt — and, for IG-RPE only, the deterministic gate that filters "
-                 "proposed WRITE calls.")
+                 "prompt — and, for SAGE only, the deterministic gate that filters "
+                 "proposed tool calls before dispatch.")
     lines.append("- Vanilla TC: minimal role + policy in the system prompt; native "
                  "function-calling does the rest.")
     lines.append("- Act: prompt instructs the model to emit tool calls only, no "
                  "reasoning prose.")
     lines.append("- ReAct: prompt requires one short `Thought:` line before each tool "
                  "call (capped to ~20 words to keep prompt growth bounded).")
-    lines.append("- IG-RPE: zero extra LLM calls on READ paths; on a blocked WRITE the "
-                 "agent is given one structured-feedback retry. The gate enforces five "
-                 "deterministic invariants (user_verified, order_fetched, "
-                 "user_confirmed, not_duplicate, under_error_budget).")
+    lines.append("- SAGE: zero extra LLM calls on the happy path; on a blocked call "
+                 "the agent gets one structured-feedback retry. The gate enforces "
+                 "three deterministic, domain-agnostic checks: JSONSchema validation "
+                 "(required / types / enums), provenance grounding (every "
+                 "identifier-shaped string argument must appear in the conversation "
+                 "corpus), and idempotency (no duplicate calls, no retry after "
+                 "repeated tool errors).")
     lines.append("- ACEBench metrics here are diagnostic. For the official score, "
                  "re-run upstream `score_agent.py` against the saved trajectories.")
     return "\n".join(lines) + "\n"

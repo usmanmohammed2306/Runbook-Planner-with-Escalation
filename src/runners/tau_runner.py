@@ -8,8 +8,9 @@ varies between them is the agent class instantiated per task:
   * ``act``      — :class:`baselines.ActAgent` (no reasoning prose, action-only)
   * ``react``    — :class:`baselines.ReActAgent` (one-line Thought before each
     Action)
-  * ``igrpe``    — :class:`ig_rpe.tau_agent.IgRpeAgent` (deterministic gate +
-    symbolic ledger; this project's contribution)
+  * ``sage``     — :class:`sage.tau_agent.SageAgent` (Schema-Anchored Grounded
+    Execution: deterministic provenance + schema gate; this project's
+    contribution)
 
 Sharing the loop guarantees the gap between conditions is due to the
 controller and not divergent control flow / tool-result formatting.
@@ -34,7 +35,7 @@ from typing import Any, Dict, List, Tuple
 from ..common.io_utils import append_jsonl, ensure_dir, safe_mean, write_json
 
 
-AGENT_CHOICES = ["baseline", "act", "react", "igrpe"]
+AGENT_CHOICES = ["baseline", "act", "react", "sage"]
 
 
 def _try_install_litellm_patch() -> None:
@@ -80,9 +81,9 @@ def _resolve_agent_cls(kind: str):
     if kind == "react":
         from ..baselines.agents import ReActAgent
         return ReActAgent
-    if kind == "igrpe":
-        from ..ig_rpe.tau_agent import IgRpeAgent
-        return IgRpeAgent
+    if kind == "sage":
+        from ..sage.tau_agent import SageAgent
+        return SageAgent
     raise ValueError(f"Unknown agent kind: {kind}")
 
 
@@ -175,7 +176,7 @@ def _solve_one(
         provider=ns.model_provider,
         temperature=float(ns.temperature),
     )
-    if ns.agent == "igrpe":
+    if ns.agent == "sage":
         agent_kwargs["env_hint"] = ns.env
     agent = AgentCls(**agent_kwargs)
     try:

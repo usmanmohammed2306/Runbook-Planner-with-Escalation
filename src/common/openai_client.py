@@ -2,9 +2,9 @@
 
 Adds two pragmatic safeguards that the bare ``OpenAI`` client doesn't have:
 
-1. **Pre-flight message truncation** — RPE / IG-RPE call the OpenAI SDK
+1. **Pre-flight message truncation** — SAGE calls the OpenAI SDK
    directly (not via ``litellm``), so the sitecustomize patch that protects
-   the baseline does NOT protect them. We monkey-patch
+   the baseline does NOT protect it. We monkey-patch
    ``client.chat.completions.create`` to call the same ``_shrink_messages``
    helper before sending, keeping the prompt under the model's context cap.
 2. **Tighter default timeout** — the SDK's default is 600 s; on a busy

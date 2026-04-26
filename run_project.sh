@@ -7,13 +7,14 @@
 # + cu130 torch stack + vLLM 0.18.0 from source), serves a single local vLLM
 # instance, and runs 12 evaluations:
 #
-#   4 controllers (vanilla tool-calling, Act, ReAct, IG-RPE)
+#   4 controllers (vanilla tool-calling, Act, ReAct, SAGE)
 #   x 3 benchmarks (tau-retail, tau-airline, ACEBench Agent)
 #
 # All four controllers share the same in-process loop, model, temperature,
 # tool schemas, max steps, and truncation budget — so the only varying axis
-# is the controller (and, for IG-RPE only, the deterministic gate). Produces
-# outputs/summary/{summary.json,summary.md}.
+# is the controller (and, for SAGE only, the deterministic gate that
+# enforces schema + provenance + idempotency on every proposed call).
+# Produces outputs/summary/{summary.json,summary.md}.
 #
 # The venv created by setup_env.sh must already exist.
 # ============================================================================
@@ -360,15 +361,15 @@ run_ace () {
 run_tau retail  baseline
 run_tau retail  act
 run_tau retail  react
-run_tau retail  igrpe
+run_tau retail  sage
 run_tau airline baseline
 run_tau airline act
 run_tau airline react
-run_tau airline igrpe
+run_tau airline sage
 run_ace baseline
 run_ace act
 run_ace react
-run_ace igrpe
+run_ace sage
 
 # ---------------------------------------------------------------------------
 # Summary
