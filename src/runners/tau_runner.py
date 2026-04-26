@@ -25,9 +25,11 @@ import argparse
 import json
 import os
 import sys
+import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from ..common.io_utils import append_jsonl, ensure_dir, safe_mean, write_json
 
@@ -152,8 +154,65 @@ def _make_env(ns: argparse.Namespace, task_index: int):
         return get_env(user_model_provider=ns.user_model_provider, **kwargs_common)
 
 
+def _solve_one(
+    ns: argparse.Namespace,
+    AgentCls,
+    task_index: int,
+    trial: int,
+) -> Dict[str, Any]:
+    """Run a single (task_index, trial) and return the record dict.
+
+    Each call constructs its own env + agent (no shared mutable state) so
+    this is safe to call from a thread pool. The vLLM server batches
+    concurrent requests internally, which is what gives us the speed-up
+    without touching the model code.
+    """
+    env = _make_env(ns, task_index)
+    agent_kwargs: Dict[str, Any] = dict(
+        tools_info=getattr(env, "tools_info", []) or [],
+        wiki=getattr(env, "wiki", "") or "",
+        model=ns.model,
+        provider=ns.model_provider,
+        temperature=float(ns.temperature),
+    )
+    if ns.agent == "igrpe":
+        agent_kwargs["env_hint"] = ns.env
+    agent = AgentCls(**agent_kwargs)
+    try:
+        result = agent.solve(env, task_index=task_index, max_num_steps=ns.max_num_steps)
+        reward = float(getattr(result, "reward", 0.0) or 0.0)
+        info = getattr(result, "info", {}) or {}
+        messages = getattr(result, "messages", []) or []
+        total_cost = float(getattr(result, "total_cost", 0.0) or 0.0)
+        status = "ok"
+        err = ""
+    except Exception as exc:  # noqa: BLE001
+        traceback.print_exc()
+        reward, info, messages, total_cost = 0.0, {"error": str(exc)}, [], 0.0
+        status = "error"
+        err = f"{exc.__class__.__name__}: {exc}"
+    return {
+        "task_id": task_index,
+        "trial": trial,
+        "reward": reward,
+        "info": info,
+        "messages": messages,
+        "total_cost": total_cost,
+        "status": status,
+        "error": err,
+    }
+
+
 def _run_inprocess(ns: argparse.Namespace) -> None:
-    """Drive ``ns.agent`` through the in-process tau-bench loop."""
+    """Drive ``ns.agent`` through the in-process tau-bench loop.
+
+    Tasks run concurrently when ``--max-concurrency > 1``: each thread runs
+    its own (env, agent) pair end-to-end and dispatches LLM calls to the
+    shared vLLM server, which batches them internally. The Python work in
+    each thread is dominated by network I/O, so the GIL is released during
+    the `chat.completions.create` call — concurrency scales with vLLM's
+    batch size, not with thread count alone.
+    """
     _try_install_litellm_patch()
     AgentCls = _resolve_agent_cls(ns.agent)
 
@@ -166,46 +225,31 @@ def _run_inprocess(ns: argparse.Namespace) -> None:
     if jsonl_path.exists():
         jsonl_path.unlink()
 
-    records: List[Dict[str, Any]] = []
-    for task_index in range(ns.start_index, ns.end_index):
-        for trial in range(ns.num_trials):
-            env = _make_env(ns, task_index)
-            agent_kwargs: Dict[str, Any] = dict(
-                tools_info=getattr(env, "tools_info", []) or [],
-                wiki=getattr(env, "wiki", "") or "",
-                model=ns.model,
-                provider=ns.model_provider,
-                temperature=float(ns.temperature),
-            )
-            if ns.agent == "igrpe":
-                agent_kwargs["env_hint"] = ns.env
-            agent = AgentCls(**agent_kwargs)
-            try:
-                result = agent.solve(env, task_index=task_index, max_num_steps=ns.max_num_steps)
-                reward = float(getattr(result, "reward", 0.0) or 0.0)
-                info = getattr(result, "info", {}) or {}
-                messages = getattr(result, "messages", []) or []
-                total_cost = float(getattr(result, "total_cost", 0.0) or 0.0)
-                status = "ok"
-                err = ""
-            except Exception as exc:  # noqa: BLE001
-                traceback.print_exc()
-                reward, info, messages, total_cost = 0.0, {"error": str(exc)}, [], 0.0
-                status = "error"
-                err = f"{exc.__class__.__name__}: {exc}"
-            record = {
-                "task_id": task_index,
-                "trial": trial,
-                "reward": reward,
-                "info": info,
-                "messages": messages,
-                "total_cost": total_cost,
-                "status": status,
-                "error": err,
-            }
-            append_jsonl(jsonl_path, record)
-            records.append(record)
+    work: List[Tuple[int, int]] = [
+        (ti, tr)
+        for ti in range(ns.start_index, ns.end_index)
+        for tr in range(ns.num_trials)
+    ]
 
+    write_lock = threading.Lock()
+    records: List[Dict[str, Any]] = []
+    max_workers = max(1, int(ns.max_concurrency))
+
+    if max_workers == 1:
+        for (ti, tr) in work:
+            rec = _solve_one(ns, AgentCls, ti, tr)
+            append_jsonl(jsonl_path, rec)
+            records.append(rec)
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {ex.submit(_solve_one, ns, AgentCls, ti, tr): (ti, tr) for (ti, tr) in work}
+            for fut in as_completed(futures):
+                rec = fut.result()
+                with write_lock:
+                    append_jsonl(jsonl_path, rec)
+                    records.append(rec)
+
+    records.sort(key=lambda r: (r.get("task_id", 0), r.get("trial", 0)))
     write_json(traj_path, records)
 
 

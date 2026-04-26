@@ -22,7 +22,9 @@ import argparse
 import json
 import os
 import sys
+import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -43,6 +45,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--language", default="en")
     p.add_argument("--limit", type=int, default=30)
     p.add_argument("--max-num-steps", type=int, default=20)
+    p.add_argument("--max-concurrency", type=int, default=1)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--output-dir", required=True)
     return p.parse_args()
@@ -277,8 +280,7 @@ def main() -> int:
     client = get_client()
     run_fn = _make_run_fn(ns.agent)
 
-    records: List[Dict[str, Any]] = []
-    for i, task in enumerate(tasks):
+    def _solve_task(i: int, task: Dict[str, Any]) -> Dict[str, Any]:
         try:
             res = run_fn(
                 client=client,
@@ -298,7 +300,7 @@ def main() -> int:
         expected = _extract_ground_truth_tools(task)
         actual = res.get("tool_calls_made", [])
         coverage = _coverage(expected, actual)
-        record = {
+        return {
             "index": i,
             "task_id": task.get("id") or task.get("task_id") or i,
             "controller": ns.agent,
@@ -312,8 +314,25 @@ def main() -> int:
             "igrpe_ledger_final": res.get("igrpe_ledger_final"),
             "igrpe_gate_stats": res.get("igrpe_gate_stats"),
         }
-        append_jsonl(traj_path, record)
-        records.append(record)
+
+    write_lock = threading.Lock()
+    records: List[Dict[str, Any]] = []
+    max_workers = max(1, int(ns.max_concurrency))
+
+    if max_workers == 1:
+        for i, task in enumerate(tasks):
+            record = _solve_task(i, task)
+            append_jsonl(traj_path, record)
+            records.append(record)
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {ex.submit(_solve_task, i, t): i for i, t in enumerate(tasks)}
+            for fut in as_completed(futures):
+                record = fut.result()
+                with write_lock:
+                    append_jsonl(traj_path, record)
+                    records.append(record)
+    records.sort(key=lambda r: r.get("index", 0))
 
     completed = [r for r in records if r.get("status") == "ok"]
     coverages = [r["tool_coverage"] for r in records if r.get("expected_tools")]
