@@ -285,6 +285,35 @@ start_vllm_once () {
 }
 
 # ---------------------------------------------------------------------------
+# Apply vLLM thread-safety patch to fix "RuntimeError: Already borrowed".
+#
+# Root cause: vLLM creates a new tool-parser instance per request, and each
+# instantiation calls tokenizer.encode(), which clashes with the async
+# engine's internal tokenizer borrow (Rust RefCell panic). The patch wraps
+# every encode() call in a threading.Lock + retry, and adds a retry loop
+# around tool_parser_cls(tokenizer) in serving.py.  Idempotent — safe to
+# re-run across subsequent invocations of run_project.sh.
+# ---------------------------------------------------------------------------
+_VLLM_SRC_DIR=""
+for _d in \
+    "${EXTERNAL_DIR}/vllm-src-0.18.0" \
+    "${EXTERNAL_DIR}/vllm-src" \
+    "${EXTERNAL_DIR}/vllm" \
+    "${REPO_ROOT}/external/vllm-src-0.18.0" \
+    "${REPO_ROOT}/external/vllm-src"; do
+  if [[ -d "$_d/vllm/tool_parsers" ]]; then
+    _VLLM_SRC_DIR="$_d"; break
+  fi
+done
+if [[ -n "$_VLLM_SRC_DIR" ]]; then
+  log "Applying vLLM tokenizer-borrow patch: $_VLLM_SRC_DIR"
+  python "$REPO_ROOT/src/_vllm_patches/fix_tokenizer_borrow.py" "$_VLLM_SRC_DIR" \
+    || log "WARNING: vLLM patch failed — will attempt run anyway"
+else
+  log "WARNING: vLLM source directory not found; skipping tokenizer-borrow patch"
+fi
+
+# ---------------------------------------------------------------------------
 # Try (model candidate × launch config) combos until one serves.
 # Per-model rungs:
 #   1. fast:   CUDA graphs ON, primary context  (skipped if ENFORCE_EAGER=1)
