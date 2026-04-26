@@ -11,7 +11,7 @@ natural-language assistant turn through ``env.step(name="respond", ...)`` —
 the same convention tau-bench's reference agent uses. There is no planner,
 no supervisor, no gate.
 
-Robustness mirrors the IG-RPE agent: context-window overflows from either the
+Robustness mirrors the SAGE agent: context-window overflows from either the
 chat completion or ``env.step`` are caught and either truncated-and-retried
 or recorded as a step error so the loop exits cleanly.
 """

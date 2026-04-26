@@ -1,11 +1,11 @@
-"""ACEBench Agent runner — vanilla / Act / ReAct / IG-RPE.
+"""ACEBench Agent runner — vanilla / Act / ReAct / SAGE.
 
 ACEBench's Agent split is scored offline against the saved trajectory.
 Tools cannot be executed live in this driver, so per-step tool results are
 stubbed; what we measure here is the *sequence of tool calls* the agent
 chooses to issue. The four controllers share an offline-stub loop and only
-differ in their system prompt or (for IG-RPE) in the gate that filters
-proposed WRITE calls.
+differ in their system prompt or (for SAGE) in the deterministic gate that
+filters proposed calls on schema / provenance / idempotency violations.
 
 Outputs:
 
@@ -35,7 +35,7 @@ from ..common.openai_client import get_client
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ACE_REPO = REPO_ROOT / "external" / "ACEBench"
-AGENT_CHOICES = ["baseline", "act", "react", "igrpe"]
+AGENT_CHOICES = ["baseline", "act", "react", "sage"]
 
 
 def _parse_args() -> argparse.Namespace:
@@ -222,11 +222,11 @@ def _make_run_fn(agent_kind: str):
             )
         return run_fn
 
-    if agent_kind == "igrpe":
-        from ..ig_rpe.ace_agent import run_igrpe
+    if agent_kind == "sage":
+        from ..sage.ace_loop import run_sage
 
         def run_fn(*, client, model, task, max_num_steps, temperature):
-            return run_igrpe(
+            return run_sage(
                 client=client,
                 model=model,
                 task=task,
@@ -311,8 +311,7 @@ def main() -> int:
             "tool_coverage": coverage,
             "num_steps": sum(1 for m in res.get("messages", []) if m.get("role") == "assistant"),
             "messages": res.get("messages", []),
-            "igrpe_ledger_final": res.get("igrpe_ledger_final"),
-            "igrpe_gate_stats": res.get("igrpe_gate_stats"),
+            "sage_gate_stats": res.get("sage_gate_stats"),
         }
 
     write_lock = threading.Lock()
