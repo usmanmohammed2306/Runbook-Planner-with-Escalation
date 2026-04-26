@@ -1,25 +1,20 @@
-"""ACEBench Agent runner — baseline and RPE.
+"""ACEBench Agent runner — vanilla / Act / ReAct / IG-RPE.
 
-ACEBench is cloned at ``external/ACEBench`` by setup_env.sh. The Agent split
-evaluates multi-turn tool use in realistic dialogue. Upstream ACEBench has
-its own inference + scoring pipeline; rather than fork it, this runner:
+ACEBench's Agent split is scored offline against the saved trajectory.
+Tools cannot be executed live in this driver, so per-step tool results are
+stubbed; what we measure here is the *sequence of tool calls* the agent
+chooses to issue. The four controllers share an offline-stub loop and only
+differ in their system prompt or (for IG-RPE) in the gate that filters
+proposed WRITE calls.
 
-  1. Discovers Agent-category task files inside the cloned ACEBench repo using
-     a small list of known relative paths. If none are found, the run is
-     recorded as ``status=skipped`` with a diagnostic ``note`` so the summary
-     builder still produces valid output.
-  2. For each task it drives a fresh conversation against our local vLLM
-     endpoint — either with a vanilla tool-calling loop (baseline) or through
-     the RPE controller. Trajectories are written as JSONL for offline
-     inspection.
-  3. Computes lightweight internal metrics that are honest about what they
-     measure: completion rate (loop exited without error), average tool-call
-     count, and — where a ``ground_truth`` trace is provided in the task —
-     a name-level tool-call coverage score. These are intended as diagnostic
-     signals, not as a replacement for ACEBench's official scorer.
+Outputs:
 
-If you need the official ACEBench score, re-run upstream
-``score_agent.py`` against the saved trajectories.
+  * ``trajectories.jsonl`` — one JSON record per task (full conversation,
+    expected vs actual tool names, controller-specific diagnostics).
+  * ``metrics.json`` — completion rate, name-coverage (where ground-truth is
+    available), avg tool calls and steps. These are diagnostic; the
+    canonical ACEBench score should be re-computed by upstream
+    ``score_agent.py`` against the saved trajectories.
 """
 from __future__ import annotations
 
@@ -31,19 +26,19 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from ..baselines.ace_loops import run_baseline_style
 from ..common.io_utils import append_jsonl, ensure_dir, safe_mean, write_json
 from ..common.openai_client import get_client
-from ..rpe.planner import apply_decision, build_runbook, decide_next
-from ..rpe.runbook import Runbook
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ACE_REPO = REPO_ROOT / "external" / "ACEBench"
+AGENT_CHOICES = ["baseline", "act", "react", "igrpe"]
 
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser("ace_runner")
-    p.add_argument("--agent", required=True, choices=["baseline", "rpe", "igrpe"])
+    p.add_argument("--agent", required=True, choices=AGENT_CHOICES)
     p.add_argument("--model", required=True)
     p.add_argument("--language", default="en")
     p.add_argument("--limit", type=int, default=30)
@@ -66,7 +61,6 @@ def _candidate_task_paths(language: str) -> List[Path]:
         f"data_agent_{lang}.json",
     ]
     candidates = [ACE_REPO / n for n in names]
-    # Also scan shallowly in case the layout differs slightly.
     if ACE_REPO.exists():
         for p in ACE_REPO.rglob(f"data_agent_{lang}.json"):
             candidates.append(p)
@@ -78,7 +72,6 @@ def _candidate_task_paths(language: str) -> List[Path]:
 
 
 def _load_tasks(language: str, limit: int) -> Tuple[List[Dict[str, Any]], Optional[Path]]:
-    """Return ``(tasks, source_path)``. Empty ``tasks`` means load failed."""
     for path in _candidate_task_paths(language):
         if not path.exists():
             continue
@@ -89,7 +82,6 @@ def _load_tasks(language: str, limit: int) -> Tuple[List[Dict[str, Any]], Option
         if not raw:
             continue
         tasks: List[Dict[str, Any]] = []
-        # Accept either a JSON array or JSONL.
         if raw[0] == "[":
             try:
                 data = json.loads(raw)
@@ -130,7 +122,6 @@ def _extract_user_turn(task: Dict[str, Any]) -> str:
 
 
 def _extract_tool_specs(task: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Normalize task['tools'] / task['functions'] into OpenAI tool specs."""
     raw = task.get("tools") or task.get("functions") or task.get("available_tools") or []
     if not isinstance(raw, list):
         return []
@@ -161,7 +152,6 @@ def _extract_tool_specs(task: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _extract_ground_truth_tools(task: Dict[str, Any]) -> List[str]:
-    """Best-effort: pull the expected sequence of tool names from the task."""
     for key in ("ground_truth", "gold", "expected", "answer", "target"):
         gt = task.get(key)
         if gt is None:
@@ -192,176 +182,11 @@ def _walk_for_tool_names(obj: Any) -> List[str]:
     return out
 
 
-# ---------------------------------------------------------------------------
-# Conversation loops
-# ---------------------------------------------------------------------------
-def _system_prompt_baseline(task: Dict[str, Any]) -> str:
+def _system_prompt_for_task(task: Dict[str, Any]) -> str:
     sys_msg = task.get("system") or task.get("system_prompt")
     if isinstance(sys_msg, str) and sys_msg.strip():
         return sys_msg.strip()
-    return (
-        "You are a helpful tool-using agent. Use the provided tools when needed. "
-        "Make exactly one tool call at a time, wait for its result, and then decide the next step. "
-        "When the user's request is resolved, reply with a short final answer."
-    )
-
-
-def _run_baseline(
-    client,
-    model: str,
-    task: Dict[str, Any],
-    max_num_steps: int,
-    temperature: float,
-) -> Dict[str, Any]:
-    tools = _extract_tool_specs(task)
-    messages: List[Dict[str, Any]] = [{"role": "system", "content": _system_prompt_baseline(task)}]
-    user = _extract_user_turn(task)
-    if user:
-        messages.append({"role": "user", "content": user})
-
-    tool_calls_made: List[str] = []
-    status = "ok"
-    error = ""
-
-    try:
-        for _ in range(max_num_steps):
-            resp = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                tools=tools or None,
-                tool_choice="auto" if tools else None,
-                temperature=temperature,
-            )
-            msg = resp.choices[0].message
-            assistant = {"role": "assistant", "content": msg.content or ""}
-            tcs = getattr(msg, "tool_calls", None) or []
-            if tcs:
-                assistant["tool_calls"] = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments or "{}",
-                        },
-                    }
-                    for tc in tcs
-                ]
-            messages.append(assistant)
-
-            if not tcs:
-                break
-
-            for tc in tcs:
-                tool_calls_made.append(tc.function.name)
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "name": tc.function.name,
-                    "content": json.dumps({"status": "simulated", "note": "ACEBench is evaluated offline; tool result is stubbed for driver execution."}),
-                })
-    except Exception as exc:  # noqa: BLE001
-        status = "error"
-        error = f"{exc.__class__.__name__}: {exc}"
-
-    return {
-        "status": status,
-        "error": error,
-        "messages": messages,
-        "tool_calls_made": tool_calls_made,
-    }
-
-
-def _run_rpe(
-    client,
-    model: str,
-    task: Dict[str, Any],
-    max_num_steps: int,
-    temperature: float,
-    max_escalations: int = 2,
-) -> Dict[str, Any]:
-    tools = _extract_tool_specs(task)
-    user = _extract_user_turn(task)
-    runbook = build_runbook(
-        client=client,
-        model=model,
-        task_description=user or str(task)[:1000],
-        tool_specs=tools,
-        policy_text="",
-        temperature=temperature,
-    )
-
-    def sys_msg() -> Dict[str, Any]:
-        base = (
-            "You are a tool-using agent following a runbook. Prefer the primary action for the "
-            "active milestone; use the fallback only when the primary just failed or made no "
-            "progress. Make one tool call at a time.\n\n"
-        )
-        return {"role": "system", "content": base + runbook.render_prompt_block()}
-
-    messages: List[Dict[str, Any]] = [sys_msg()]
-    if user:
-        messages.append({"role": "user", "content": user})
-
-    tool_calls_made: List[str] = []
-    status = "ok"
-    error = ""
-
-    try:
-        for step in range(max_num_steps):
-            messages[0] = sys_msg()
-            resp = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                tools=tools or None,
-                tool_choice="auto" if tools else None,
-                temperature=temperature,
-            )
-            msg = resp.choices[0].message
-            assistant = {"role": "assistant", "content": msg.content or ""}
-            tcs = getattr(msg, "tool_calls", None) or []
-            if tcs:
-                assistant["tool_calls"] = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments or "{}",
-                        },
-                    }
-                    for tc in tcs
-                ]
-            messages.append(assistant)
-
-            if not tcs:
-                # Natural language — treat as the model indicating closure.
-                decision = decide_next(client, model, runbook, assistant["content"], temperature=temperature)
-                apply_decision(runbook, decision, max_escalations)
-                break
-
-            for tc in tcs:
-                tool_calls_made.append(tc.function.name)
-                stub = json.dumps({"status": "simulated", "note": "ACEBench tool results are evaluated offline."})
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "name": tc.function.name,
-                    "content": stub,
-                })
-                decision = decide_next(client, model, runbook, stub, temperature=temperature)
-                apply_decision(runbook, decision, max_escalations)
-    except Exception as exc:  # noqa: BLE001
-        status = "error"
-        error = f"{exc.__class__.__name__}: {exc}"
-
-    return {
-        "status": status,
-        "error": error,
-        "messages": messages,
-        "tool_calls_made": tool_calls_made,
-        "rpe_runbook_final": runbook.to_dict(),
-    }
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +204,40 @@ def _coverage(expected: List[str], actual: List[str]) -> float:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def _make_run_fn(agent_kind: str):
+    if agent_kind in ("baseline", "act", "react"):
+        def run_fn(*, client, model, task, max_num_steps, temperature):
+            return run_baseline_style(
+                style=agent_kind,
+                client=client,
+                model=model,
+                task=task,
+                tool_specs=_extract_tool_specs(task),
+                user_turn=_extract_user_turn(task),
+                max_num_steps=max_num_steps,
+                temperature=temperature,
+            )
+        return run_fn
+
+    if agent_kind == "igrpe":
+        from ..ig_rpe.ace_agent import run_igrpe
+
+        def run_fn(*, client, model, task, max_num_steps, temperature):
+            return run_igrpe(
+                client=client,
+                model=model,
+                task=task,
+                tool_specs=_extract_tool_specs(task),
+                user_turn=_extract_user_turn(task),
+                system_prompt=_system_prompt_for_task(task),
+                max_num_steps=max_num_steps,
+                temperature=temperature,
+            )
+        return run_fn
+
+    raise ValueError(f"Unknown agent kind: {agent_kind}")
+
+
 def main() -> int:
     ns = _parse_args()
     out_dir = ensure_dir(ns.output_dir)
@@ -416,24 +275,7 @@ def main() -> int:
         return 0
 
     client = get_client()
-    if ns.agent == "baseline":
-        run_fn = _run_baseline
-    elif ns.agent == "rpe":
-        run_fn = _run_rpe
-    else:
-        from ..ig_rpe.ace_agent import run_igrpe as _igrpe_fn
-
-        def run_fn(client, model, task, max_num_steps, temperature):  # type: ignore[misc]
-            return _igrpe_fn(
-                client=client,
-                model=model,
-                task=task,
-                tool_specs=_extract_tool_specs(task),
-                user_turn=_extract_user_turn(task),
-                system_prompt=_system_prompt_baseline(task),
-                max_num_steps=max_num_steps,
-                temperature=temperature,
-            )
+    run_fn = _make_run_fn(ns.agent)
 
     records: List[Dict[str, Any]] = []
     for i, task in enumerate(tasks):
@@ -459,6 +301,7 @@ def main() -> int:
         record = {
             "index": i,
             "task_id": task.get("id") or task.get("task_id") or i,
+            "controller": ns.agent,
             "status": res.get("status"),
             "error": res.get("error"),
             "expected_tools": expected,
@@ -466,7 +309,6 @@ def main() -> int:
             "tool_coverage": coverage,
             "num_steps": sum(1 for m in res.get("messages", []) if m.get("role") == "assistant"),
             "messages": res.get("messages", []),
-            "rpe_runbook_final": res.get("rpe_runbook_final"),
             "igrpe_ledger_final": res.get("igrpe_ledger_final"),
             "igrpe_gate_stats": res.get("igrpe_gate_stats"),
         }

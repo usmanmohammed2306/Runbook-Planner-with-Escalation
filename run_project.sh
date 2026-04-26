@@ -2,11 +2,18 @@
 # ============================================================================
 # run_project.sh
 #
-# One-shot driver for the RPE experiment. Loads the same cluster toolchain
-# that setup_env.sh used, activates the .venv (Python 3.12 + cu130 torch
-# stack + vLLM 0.18.0 from source), serves a single local vLLM instance, and
-# runs the six evaluations (baseline + RPE over tau-retail, tau-airline,
-# ACEBench Agent). Produces outputs/summary/{summary.json,summary.md}.
+# One-shot driver for the four-way comparison experiment. Loads the same
+# cluster toolchain that setup_env.sh used, activates the .venv (Python 3.12
+# + cu130 torch stack + vLLM 0.18.0 from source), serves a single local vLLM
+# instance, and runs 12 evaluations:
+#
+#   4 controllers (vanilla tool-calling, Act, ReAct, IG-RPE)
+#   x 3 benchmarks (tau-retail, tau-airline, ACEBench Agent)
+#
+# All four controllers share the same in-process loop, model, temperature,
+# tool schemas, max steps, and truncation budget — so the only varying axis
+# is the controller (and, for IG-RPE only, the deterministic gate). Produces
+# outputs/summary/{summary.json,summary.md}.
 #
 # The venv created by setup_env.sh must already exist.
 # ============================================================================
@@ -162,30 +169,30 @@ MODEL_CANDIDATES=(
   "Qwen/Qwen3-4B-Instruct-2507"
 )
 
-# Sized to fit the full 9-condition pipeline (3 controllers × 3 benchmarks)
-# in ~7-8 hours on a single A100 with --enforce-eager. Override these env
-# vars for a longer/shorter sweep.
+# Sized to fit the 12-condition pipeline (4 controllers × 3 benchmarks)
+# under ~5 h on a single A100 with --enforce-eager. Override via env vars
+# for a longer/shorter sweep.
 #
-# Calculation (eager-mode Qwen2.5-7B at ~5.5 s/LLM-call wall-clock):
-#   tau-bench:  15 tasks × 1 trial × 2 envs = 30 trajectories per controller
-#               baseline ~33 calls/traj, RPE ~33 calls/traj (replan_every=3),
-#               IG-RPE ~27 calls/traj.  Sum ≈ 30 × (33+33+27) × 5.5 ≈ 4.6 h
-#   ACEBench:   20 tasks × 3 controllers ≈ 20 × (18+22+18) × 5.5 ≈ 1.7 h
+# Wall-clock estimate (eager-mode Qwen2.5-7B at ~5 s/LLM-call):
+#   tau-bench:  10 tasks × 1 trial × 2 envs × 4 controllers = 80 trajs
+#               avg ~22 LLM calls/traj  →  80 × 22 × 5 = 8800 s ≈ 2.45 h
+#   ACEBench:   15 tasks × 4 controllers = 60 trajs
+#               avg ~10 LLM calls/traj  →  60 × 10 × 5 = 3000 s ≈ 0.83 h
 #   vLLM start + summary: ~0.3 h
-#   Total: ~6.6 h, with ~1 h buffer for retries/slow tasks.
+#   Total: ~3.6 h, with ~1.5 h buffer for slow/long tasks → fits <5 h.
 TAU_TASK_SPLIT="${TAU_TASK_SPLIT:-test}"
 TAU_START_INDEX="${TAU_START_INDEX:-0}"
-TAU_END_INDEX="${TAU_END_INDEX:-15}"
+TAU_END_INDEX="${TAU_END_INDEX:-10}"
 TAU_NUM_TRIALS="${TAU_NUM_TRIALS:-1}"
 TAU_MAX_CONCURRENCY="${TAU_MAX_CONCURRENCY:-1}"
 TAU_TEMPERATURE="${TAU_TEMPERATURE:-0.0}"
 TAU_MAX_STEPS="${TAU_MAX_STEPS:-30}"
 
-ACE_LIMIT="${ACE_LIMIT:-20}"
-ACE_MAX_STEPS="${ACE_MAX_STEPS:-20}"
+ACE_LIMIT="${ACE_LIMIT:-15}"
+ACE_MAX_STEPS="${ACE_MAX_STEPS:-15}"
 ACE_LANGUAGE="${ACE_LANGUAGE:-en}"
 
-# OpenAI SDK timeout for RPE/IG-RPE direct calls. 60 s is enough for any
+# OpenAI SDK timeout for direct in-process calls. 60 s is enough for any
 # normal Qwen2.5-7B response on 1×A100; shorter than the SDK's 600 s default
 # so a stuck/overflow request fails fast instead of blocking the loop.
 export OPENAI_TIMEOUT="${OPENAI_TIMEOUT:-60}"
@@ -295,7 +302,7 @@ if [[ "$STARTED" != "1" ]]; then
   exit 1
 fi
 
-log "Using $ACTIVE_MODEL (impl=$ACTIVE_IMPL max_len=$ACTIVE_MAX_LEN) for BOTH baseline and RPE"
+log "Using $ACTIVE_MODEL (impl=$ACTIVE_IMPL max_len=$ACTIVE_MAX_LEN) for ALL controllers"
 
 # ---------------------------------------------------------------------------
 # OpenAI-compatible client config
@@ -345,13 +352,16 @@ run_ace () {
 }
 
 run_tau retail  baseline
-run_tau retail  rpe
+run_tau retail  act
+run_tau retail  react
 run_tau retail  igrpe
 run_tau airline baseline
-run_tau airline rpe
+run_tau airline act
+run_tau airline react
 run_tau airline igrpe
 run_ace baseline
-run_ace rpe
+run_ace act
+run_ace react
 run_ace igrpe
 
 # ---------------------------------------------------------------------------

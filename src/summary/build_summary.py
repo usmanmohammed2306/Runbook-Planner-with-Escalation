@@ -1,13 +1,20 @@
 """Aggregate per-run metrics.json files into outputs/summary/{summary.json,summary.md}.
 
-Supports a 3-way comparison across three conditions on the same fixed base model:
+Renders a four-way comparison across the same fixed base model:
 
-  1. baseline — vanilla tool-calling (tau-bench's reference path)
-  2. rpe      — lightweight Runbook Planner with Escalation
-  3. igrpe    — Invariant-Gated RPE (new): deterministic gate + symbolic ledger
+  1. baseline — vanilla tool-calling (minimal system prompt)
+  2. act      — Act (Yao et al. 2022): action-only, no reasoning prose
+  3. react    — ReAct (Yao et al. 2022): one-line Thought before each Action
+  4. igrpe    — Invariant-Gated RPE (this project's contribution): deterministic
+                pre-write gate over a symbolic ledger
 
-Each section renders rows for all available conditions; missing runs are
-reported as ``status=missing`` without breaking the table.
+Each section renders a row per metric for all four conditions. Missing runs
+are reported as ``status=missing`` so the table never collapses on partial
+data.
+
+The summary also computes a ``deltas`` block per benchmark — IG-RPE minus the
+strongest baseline on the headline metric (success rate for tau-bench,
+completion rate for ACEBench) — to make the wins immediately visible.
 """
 from __future__ import annotations
 
@@ -21,30 +28,33 @@ from typing import Any, Dict, List, Optional, Tuple
 from ..common.io_utils import read_json, write_json
 
 
-# (section_label, {condition: subdir})
 SECTIONS: List[Tuple[str, Dict[str, str]]] = [
     ("tau-bench retail", {
         "baseline": "tau_retail_baseline",
-        "rpe": "tau_retail_rpe",
+        "act": "tau_retail_act",
+        "react": "tau_retail_react",
         "igrpe": "tau_retail_igrpe",
     }),
     ("tau-bench airline", {
         "baseline": "tau_airline_baseline",
-        "rpe": "tau_airline_rpe",
+        "act": "tau_airline_act",
+        "react": "tau_airline_react",
         "igrpe": "tau_airline_igrpe",
     }),
     ("ACEBench Agent", {
         "baseline": "acebench_agent_baseline",
-        "rpe": "acebench_agent_rpe",
+        "act": "acebench_agent_act",
+        "react": "acebench_agent_react",
         "igrpe": "acebench_agent_igrpe",
     }),
 ]
 
-CONDITIONS: List[str] = ["baseline", "rpe", "igrpe"]
+CONDITIONS: List[str] = ["baseline", "act", "react", "igrpe"]
 CONDITION_LABELS: Dict[str, str] = {
-    "baseline": "Baseline",
-    "rpe": "RPE",
-    "igrpe": "IG-RPE",
+    "baseline": "Vanilla TC",
+    "act": "Act",
+    "react": "ReAct",
+    "igrpe": "IG-RPE (ours)",
 }
 
 
@@ -86,50 +96,65 @@ def _num(x: Any, digits: int = 2) -> str:
         return "n/a"
 
 
-def _tau_rows(label: str, by_cond: Dict[str, Dict[str, Any]]) -> List[str]:
+def _rows_with_keys(label: str, by_cond: Dict[str, Dict[str, Any]],
+                    rows_spec: List[Tuple[str, str, Any]]) -> List[str]:
     def cell(cond: str, key: str, fmt) -> str:
         metrics = (by_cond.get(cond, {}) or {}).get("metrics", {}) or {}
         return fmt(metrics.get(key))
     header = f"| {label} | Metric | " + " | ".join(CONDITION_LABELS[c] for c in CONDITIONS) + " |"
     sep = "|" + "|".join(["---"] * (2 + len(CONDITIONS))) + "|"
     rows: List[str] = []
-    for key, human, fmt in [
+    for key, human, fmt in rows_spec:
+        row = f"| {label} | {human} | " + " | ".join(cell(c, key, fmt) for c in CONDITIONS) + " |"
+        rows.append(row)
+    status_row = f"| {label} | status | " + " | ".join(
+        str((by_cond.get(c) or {}).get("status", "n/a")) for c in CONDITIONS
+    ) + " |"
+    rows.append(status_row)
+    return [header, sep] + rows
+
+
+def _tau_rows(label: str, by_cond: Dict[str, Dict[str, Any]]) -> List[str]:
+    return _rows_with_keys(label, by_cond, [
         ("success_rate", "success rate", _pct),
         ("avg_reward", "avg reward", _num),
         ("num_tasks", "tasks", lambda x: str(x) if x is not None else "n/a"),
         ("error_tasks", "error tasks", lambda x: str(x) if x is not None else "n/a"),
         ("avg_trajectory_messages", "avg traj msgs", _num),
-    ]:
-        row = f"| {label} | {human} | " + " | ".join(cell(c, key, fmt) for c in CONDITIONS) + " |"
-        rows.append(row)
-    status_row = f"| {label} | status | " + " | ".join(
-        str((by_cond.get(c) or {}).get("status", "n/a")) for c in CONDITIONS
-    ) + " |"
-    rows.append(status_row)
-    return [header, sep] + rows
+    ])
 
 
 def _ace_rows(label: str, by_cond: Dict[str, Dict[str, Any]]) -> List[str]:
-    def cell(cond: str, key: str, fmt) -> str:
-        metrics = (by_cond.get(cond, {}) or {}).get("metrics", {}) or {}
-        return fmt(metrics.get(key))
-    header = f"| {label} | Metric | " + " | ".join(CONDITION_LABELS[c] for c in CONDITIONS) + " |"
-    sep = "|" + "|".join(["---"] * (2 + len(CONDITIONS))) + "|"
-    rows: List[str] = []
-    for key, human, fmt in [
+    return _rows_with_keys(label, by_cond, [
         ("completion_rate", "completion rate", _pct),
         ("tool_name_coverage", "tool-name coverage", _pct),
         ("avg_tool_calls", "avg tool calls", _num),
         ("avg_steps", "avg steps", _num),
         ("num_tasks", "tasks", lambda x: str(x) if x is not None else "n/a"),
-    ]:
-        row = f"| {label} | {human} | " + " | ".join(cell(c, key, fmt) for c in CONDITIONS) + " |"
-        rows.append(row)
-    status_row = f"| {label} | status | " + " | ".join(
-        str((by_cond.get(c) or {}).get("status", "n/a")) for c in CONDITIONS
-    ) + " |"
-    rows.append(status_row)
-    return [header, sep] + rows
+    ])
+
+
+def _headline_metric_key(label: str) -> str:
+    return "success_rate" if label.startswith("tau") else "completion_rate"
+
+
+def _strongest_baseline(by_cond: Dict[str, Dict[str, Any]], key: str) -> Tuple[Optional[str], Optional[float]]:
+    """Return (condition_name, value) for the best non-IG-RPE controller on ``key``."""
+    best_cond: Optional[str] = None
+    best_val: Optional[float] = None
+    for c in ("baseline", "act", "react"):
+        m = (by_cond.get(c, {}) or {}).get("metrics", {}) or {}
+        v = m.get(key)
+        if v is None:
+            continue
+        try:
+            v_f = float(v)
+        except Exception:
+            continue
+        if best_val is None or v_f > best_val:
+            best_val = v_f
+            best_cond = c
+    return best_cond, best_val
 
 
 def build(outputs_dir: Path, active_model: str, served_name: str) -> Dict[str, Any]:
@@ -144,28 +169,74 @@ def build(outputs_dir: Path, active_model: str, served_name: str) -> Dict[str, A
         "active_model": active_model,
         "served_name": served_name,
         "sections": [],
+        "deltas": [],
     }
     for label, subdirs in SECTIONS:
         by_cond = {cond: _load(outputs_dir, subdirs[cond]) for cond in CONDITIONS if cond in subdirs}
         summary["sections"].append({"label": label, "by_condition": by_cond})
+
+        key = _headline_metric_key(label)
+        best_cond, best_val = _strongest_baseline(by_cond, key)
+        igrpe_metrics = (by_cond.get("igrpe", {}) or {}).get("metrics", {}) or {}
+        igrpe_val = igrpe_metrics.get(key)
+        try:
+            igrpe_val_f = float(igrpe_val) if igrpe_val is not None else None
+        except Exception:
+            igrpe_val_f = None
+        delta: Dict[str, Any] = {
+            "section": label,
+            "metric": key,
+            "best_baseline": best_cond,
+            "best_baseline_value": best_val,
+            "igrpe_value": igrpe_val_f,
+            "delta_vs_best_baseline": (
+                igrpe_val_f - best_val
+                if igrpe_val_f is not None and best_val is not None
+                else None
+            ),
+        }
+        summary["deltas"].append(delta)
     return summary
 
 
 def render_markdown(summary: Dict[str, Any]) -> str:
     lines: List[str] = []
-    lines.append("# Baseline vs RPE vs IG-RPE — Comparison Summary")
+    lines.append("# Vanilla / Act / ReAct / IG-RPE — Comparison Summary")
     lines.append("")
     lines.append(f"- Active model: `{summary.get('active_model') or '(unknown)'}`")
     lines.append(f"- Served name:  `{summary.get('served_name') or '(unknown)'}`")
     lines.append("")
     lines.append(
-        "Same fixed base model across all three conditions. Baseline = vanilla "
-        "tool-calling. RPE = runbook planner with an LLM supervisor. IG-RPE = "
-        "invariant-gated tool-calling with a symbolic ledger (this project's "
-        "contribution)."
+        "Same fixed base model and same in-process loop across all four conditions. "
+        "Vanilla TC = minimal system prompt with native function-calling. "
+        "Act = action-only, no reasoning prose (Yao et al. 2022). "
+        "ReAct = one-line Thought before each Action (Yao et al. 2022). "
+        "IG-RPE = invariant-gated tool-calling with a deterministic symbolic "
+        "ledger (this project's contribution)."
     )
     lines.append("")
-    lines.append("## Results")
+    lines.append("## Headline deltas (IG-RPE vs. best of vanilla / Act / ReAct)")
+    lines.append("")
+    lines.append("| Benchmark | Metric | Best baseline | Best baseline value | IG-RPE | Δ |")
+    lines.append("|---|---|---|---|---|---|")
+    for d in summary.get("deltas", []):
+        bb = d.get("best_baseline") or "n/a"
+        bb_label = CONDITION_LABELS.get(bb, bb)
+        bbv = d.get("best_baseline_value")
+        igv = d.get("igrpe_value")
+        dv = d.get("delta_vs_best_baseline")
+        is_pct_metric = d.get("metric") in ("success_rate", "completion_rate", "tool_name_coverage")
+        bbv_s = _pct(bbv) if is_pct_metric else _num(bbv)
+        igv_s = _pct(igv) if is_pct_metric else _num(igv)
+        if dv is None:
+            dv_s = "n/a"
+        elif is_pct_metric:
+            dv_s = f"{100.0 * dv:+.1f} pp"
+        else:
+            dv_s = f"{dv:+.2f}"
+        lines.append(f"| {d.get('section')} | {d.get('metric')} | {bb_label} | {bbv_s} | {igv_s} | {dv_s} |")
+    lines.append("")
+    lines.append("## Per-benchmark detail")
     lines.append("")
     for section in summary["sections"]:
         label = section["label"]
@@ -186,10 +257,23 @@ def render_markdown(summary: Dict[str, Any]) -> str:
                 lines.append(f"- **{section['label']} / {CONDITION_LABELS[cond]}**: {note}")
     lines.append("")
     lines.append("## Method notes")
-    lines.append("- Baseline uses tau-bench's upstream `tool-calling` agent; metrics parsed from its per-trial JSON.")
-    lines.append("- RPE adds a compact runbook + per-turn supervisor; two extra LLM calls per step.")
-    lines.append("- IG-RPE adds zero LLM calls on READ paths and at most one retry on a blocked WRITE; the gate is deterministic.")
-    lines.append("- ACEBench metrics are internal diagnostic signals (completion rate, tool-name coverage). For the official score, re-run upstream `score_agent.py` against the saved trajectories.")
+    lines.append("- All four controllers share the SAME in-process tool-calling loop "
+                 "(same model, same tools, same temperature, same max-steps, same "
+                 "truncation budget). The only thing that varies is the system "
+                 "prompt — and, for IG-RPE only, the deterministic gate that filters "
+                 "proposed WRITE calls.")
+    lines.append("- Vanilla TC: minimal role + policy in the system prompt; native "
+                 "function-calling does the rest.")
+    lines.append("- Act: prompt instructs the model to emit tool calls only, no "
+                 "reasoning prose.")
+    lines.append("- ReAct: prompt requires one short `Thought:` line before each tool "
+                 "call (capped to ~20 words to keep prompt growth bounded).")
+    lines.append("- IG-RPE: zero extra LLM calls on READ paths; on a blocked WRITE the "
+                 "agent is given one structured-feedback retry. The gate enforces five "
+                 "deterministic invariants (user_verified, order_fetched, "
+                 "user_confirmed, not_duplicate, under_error_budget).")
+    lines.append("- ACEBench metrics here are diagnostic. For the official score, "
+                 "re-run upstream `score_agent.py` against the saved trajectories.")
     return "\n".join(lines) + "\n"
 
 
