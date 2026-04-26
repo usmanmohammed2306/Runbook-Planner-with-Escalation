@@ -123,26 +123,37 @@ export VLLM_ENGINE_READY_TIMEOUT_S="$VLLM_READY_TIMEOUT"
 VLLM_COMPILATION_CONFIG='{"mode":0,"custom_ops":["none"],"pass_config":{"fuse_norm_quant":false,"fuse_act_quant":false,"fuse_attn_quant":false}}'
 
 # Primary + fallback (max_model_len, gpu_memory_utilization, model-impl, eager).
-# Rung 1 (FAST): CUDA graphs ON — ~2-3x faster decode than eager. If CUDA-graph
-#   capture OOMs at startup or the kernel fails, we automatically drop to rung 2
-#   which is the previous known-good eager config.
-# Rung 2 (SAFE): eager mode at the same context — guaranteed to work since this
-#   was the previously-shipped primary configuration.
-# Rung 3/4: progressively shrink context, finally fall back to transformers backend.
-# Override: set ENFORCE_EAGER=1 to skip rung 1 and go straight to rung 2.
+# Rung 1 (eager, primary context):  the known-good config. Default.
+# Rung 2 (eager, smaller context):  for OOM at primary context.
+# Rung 3 (transformers backend):    last-resort path with no CUDA-graph deps.
+#
+# Why not try CUDA graphs first?
+#   We pin compilation_config.mode=0 (NO_COMPILATION) for stability. vLLM 0.18
+#   then auto-overrides cudagraph_mode -> NONE anyway, so dropping
+#   --enforce-eager gains zero speed but routes through a different warmup
+#   path (_dummy_run) that hits cudaErrorNoKernelImageForDevice in FlashAttn
+#   on cu130 builds. Net: eager is strictly the safe and equivalent choice.
+#   Set ENFORCE_EAGER=0 to opt back into the experimental fast rung.
 PRIMARY_MAX_LEN="${MAX_MODEL_LEN:-16384}"
 PRIMARY_MEM_UTIL="${GPU_MEM_UTIL:-0.80}"
 PRIMARY_IMPL="${MODEL_IMPL:-auto}"
-ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
+ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
 FALLBACK1_IMPL="auto";         FALLBACK1_MAX_LEN="12288"; FALLBACK1_MEM_UTIL="0.75"
 FALLBACK2_IMPL="transformers"; FALLBACK2_MAX_LEN="8192";  FALLBACK2_MEM_UTIL="0.65"
 
 # Truncation patch is sized for the 16 K context. The hard budget triggers
 # the patch's iterative shrink: if a normal pass leaves the prompt over
 # HARD_BUDGET chars, the patch keeps shrinking until it fits.
-export TAU_PATCH_MAX_TOOL_CHARS="${TAU_PATCH_MAX_TOOL_CHARS:-2000}"
-export TAU_PATCH_SOFT_BUDGET="${TAU_PATCH_SOFT_BUDGET:-28000}"
-export TAU_PATCH_HARD_BUDGET="${TAU_PATCH_HARD_BUDGET:-32000}"
+#
+# Soft=40K means most short trajectories pass through unmodified (preserving
+# the JSON detail the agent needs to pick correct item_ids). Hard=26K caps
+# the prompt to ~10K input tokens at JSON density (3 chars/token), leaving
+# headroom under the 16K-token model context for tool schemas (~3K tokens)
+# and decode (~1.5K). Last-resort floor inside sitecustomize.py shrinks
+# old observations to 250 chars while keeping the most recent 3 readable.
+export TAU_PATCH_MAX_TOOL_CHARS="${TAU_PATCH_MAX_TOOL_CHARS:-3000}"
+export TAU_PATCH_SOFT_BUDGET="${TAU_PATCH_SOFT_BUDGET:-40000}"
+export TAU_PATCH_HARD_BUDGET="${TAU_PATCH_HARD_BUDGET:-26000}"
 
 # Qwen2.5-7B first — stable 32K context, best tool-calling quality at this size.
 MODEL_CANDIDATES=(
@@ -151,17 +162,33 @@ MODEL_CANDIDATES=(
   "Qwen/Qwen3-4B-Instruct-2507"
 )
 
+# Sized to fit the full 9-condition pipeline (3 controllers × 3 benchmarks)
+# in ~7-8 hours on a single A100 with --enforce-eager. Override these env
+# vars for a longer/shorter sweep.
+#
+# Calculation (eager-mode Qwen2.5-7B at ~5.5 s/LLM-call wall-clock):
+#   tau-bench:  15 tasks × 1 trial × 2 envs = 30 trajectories per controller
+#               baseline ~33 calls/traj, RPE ~33 calls/traj (replan_every=3),
+#               IG-RPE ~27 calls/traj.  Sum ≈ 30 × (33+33+27) × 5.5 ≈ 4.6 h
+#   ACEBench:   20 tasks × 3 controllers ≈ 20 × (18+22+18) × 5.5 ≈ 1.7 h
+#   vLLM start + summary: ~0.3 h
+#   Total: ~6.6 h, with ~1 h buffer for retries/slow tasks.
 TAU_TASK_SPLIT="${TAU_TASK_SPLIT:-test}"
 TAU_START_INDEX="${TAU_START_INDEX:-0}"
-TAU_END_INDEX="${TAU_END_INDEX:-20}"
+TAU_END_INDEX="${TAU_END_INDEX:-15}"
 TAU_NUM_TRIALS="${TAU_NUM_TRIALS:-1}"
 TAU_MAX_CONCURRENCY="${TAU_MAX_CONCURRENCY:-1}"
 TAU_TEMPERATURE="${TAU_TEMPERATURE:-0.0}"
 TAU_MAX_STEPS="${TAU_MAX_STEPS:-30}"
 
-ACE_LIMIT="${ACE_LIMIT:-30}"
+ACE_LIMIT="${ACE_LIMIT:-20}"
 ACE_MAX_STEPS="${ACE_MAX_STEPS:-20}"
 ACE_LANGUAGE="${ACE_LANGUAGE:-en}"
+
+# OpenAI SDK timeout for RPE/IG-RPE direct calls. 60 s is enough for any
+# normal Qwen2.5-7B response on 1×A100; shorter than the SDK's 600 s default
+# so a stuck/overflow request fails fast instead of blocking the loop.
+export OPENAI_TIMEOUT="${OPENAI_TIMEOUT:-60}"
 
 OUTPUTS_DIR="${OUTPUTS_DIR:-${REPO_ROOT}/outputs}"
 mkdir -p "$OUTPUTS_DIR/summary"

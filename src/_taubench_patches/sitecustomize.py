@@ -25,9 +25,9 @@ from __future__ import annotations
 import os
 import sys
 
-MAX_TOOL_CHARS = int(os.environ.get("TAU_PATCH_MAX_TOOL_CHARS", "2000"))
-SOFT_TOTAL_CHAR_BUDGET = int(os.environ.get("TAU_PATCH_SOFT_BUDGET", "28000"))
-HARD_TOTAL_CHAR_BUDGET = int(os.environ.get("TAU_PATCH_HARD_BUDGET", "32000"))
+MAX_TOOL_CHARS = int(os.environ.get("TAU_PATCH_MAX_TOOL_CHARS", "3000"))
+SOFT_TOTAL_CHAR_BUDGET = int(os.environ.get("TAU_PATCH_SOFT_BUDGET", "40000"))
+HARD_TOTAL_CHAR_BUDGET = int(os.environ.get("TAU_PATCH_HARD_BUDGET", "26000"))
 KEEP_SYSTEM_FULL = True
 
 
