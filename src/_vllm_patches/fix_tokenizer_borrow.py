@@ -41,27 +41,77 @@ Usage (from run_project.sh)
 """
 from __future__ import annotations
 
+import ast
 import re
 import sys
 from pathlib import Path
 
 MARKER = "# _SAGE_BORROW_FIX_APPLIED"
 MARKER_JSON = "# _SAGE_JSON_FIX_APPLIED"
+BACKUP_SUFFIX = ".sage_orig"
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _ensure_clean_source(path: Path) -> str:
+    """Return the *original* source. Creates a backup on first call; restores
+    from backup on subsequent calls so the patcher always operates on the
+    pristine file (self-healing if a previous patch corrupted it)."""
+    backup = path.with_suffix(path.suffix + BACKUP_SUFFIX)
+    if backup.exists():
+        # Restore from backup so we always patch a clean original.
+        path.write_text(backup.read_text(encoding="utf-8"), encoding="utf-8")
+    else:
+        backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    return path.read_text(encoding="utf-8")
+
+
 def _insert_after_imports(src: str, block: str) -> str:
-    """Insert ``block`` after the last top-level import/from statement."""
+    """Insert ``block`` after the last top-level import/from statement.
+
+    Uses ``ast`` to find the true *end* of the last import (handles multi-line
+    parenthesised ``from x import (...)`` blocks correctly).
+    """
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        tree = None
+
+    insert_line = 0  # 0-based line index to insert *before*
+    if tree is not None:
+        for node in tree.body:
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                # end_lineno is 1-based and inclusive; insert after it.
+                end = getattr(node, "end_lineno", node.lineno) or node.lineno
+                if end > insert_line:
+                    insert_line = end
+    else:
+        # Fallback: line-based scan (last single-line import/from).
+        for i, line in enumerate(src.splitlines()):
+            s = line.lstrip()
+            if s.startswith("import ") or s.startswith("from "):
+                insert_line = i + 1
+
     lines = src.splitlines(keepends=True)
-    last_import = 0
-    for i, line in enumerate(lines):
-        s = line.lstrip()
-        if s.startswith("import ") or s.startswith("from "):
-            last_import = i
-    lines.insert(last_import + 1, block)
+    lines.insert(insert_line, block)
     return "".join(lines)
+
+
+def _validate_syntax(path: Path) -> bool:
+    try:
+        ast.parse(path.read_text(encoding="utf-8"))
+        return True
+    except SyntaxError as e:
+        print(f"  SYNTAX ERROR in {path.name}: {e}")
+        return False
+
+
+def _restore_from_backup(path: Path) -> None:
+    backup = path.with_suffix(path.suffix + BACKUP_SUFFIX)
+    if backup.exists():
+        path.write_text(backup.read_text(encoding="utf-8"), encoding="utf-8")
+        print(f"  restored {path.name} from backup")
 
 
 # Code injected at module level in each tool-parser file.
@@ -92,21 +142,22 @@ def _sage_encode(tokenizer, *args, **kwargs):
 # ---------------------------------------------------------------------------
 
 def patch_tool_parser(path: Path) -> None:
-    src = path.read_text(encoding="utf-8")
-    if MARKER in src:
-        print(f"  skip (already patched): {path.name}")
-        return
+    # Always restore-from/create-backup so we re-patch a pristine file each run.
+    src = _ensure_clean_source(path)
 
     if "self.model_tokenizer.encode(" not in src:
         print(f"  skip (no encode pattern): {path.name}")
         return
 
-    src = _insert_after_imports(src, _LOCK_BLOCK)
-    src = src.replace(
+    new_src = _insert_after_imports(src, _LOCK_BLOCK)
+    new_src = new_src.replace(
         "self.model_tokenizer.encode(",
         "_sage_encode(self.model_tokenizer,",
     )
-    path.write_text(src, encoding="utf-8")
+    path.write_text(new_src, encoding="utf-8")
+    if not _validate_syntax(path):
+        _restore_from_backup(path)
+        return
     print(f"  patched: {path.name}")
 
 
@@ -139,16 +190,16 @@ def _serving_replacement(m: re.Match) -> str:
 
 
 def patch_serving(path: Path) -> None:
-    src = path.read_text(encoding="utf-8")
-    if MARKER in src:
-        print(f"  skip (already patched): {path.name}")
-        return
+    src = _ensure_clean_source(path)
 
     new_src, count = _SERVING_PATTERN.subn(_serving_replacement, src)
     if count == 0:
         print(f"  skip (pattern not found): {path.name}")
         return
     path.write_text(new_src, encoding="utf-8")
+    if not _validate_syntax(path):
+        _restore_from_backup(path)
+        return
     print(f"  patched: {path.name} ({count} site(s))")
 
 
@@ -185,13 +236,15 @@ _JSON_LOADS_PATTERN = re.compile(
 
 
 def patch_json_loads(path: Path) -> None:
-    src = path.read_text(encoding="utf-8")
-    if MARKER_JSON in src:
+    # Snapshot current (post-borrow-fix) state in memory so we can revert just
+    # this layer without losing the prior patch.
+    pre = path.read_text(encoding="utf-8")
+    if MARKER_JSON in pre:
         print(f"  skip (already patched json): {path.name}")
         return
 
     new_src, count = _JSON_LOADS_PATTERN.subn(
-        lambda m: f"_sage_json_load({m.group(1)})", src
+        lambda m: f"_sage_json_load({m.group(1)})", pre
     )
     if count == 0:
         print(f"  skip (json.loads pattern not found): {path.name}")
@@ -199,6 +252,10 @@ def patch_json_loads(path: Path) -> None:
 
     new_src = _insert_after_imports(new_src, _JSON_HELPER_BLOCK)
     path.write_text(new_src, encoding="utf-8")
+    if not _validate_syntax(path):
+        path.write_text(pre, encoding="utf-8")
+        print(f"  reverted json patch on {path.name}")
+        return
     print(f"  patched json.loads→_sage_json_load: {path.name} ({count} site(s))")
 
 
