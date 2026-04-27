@@ -1,42 +1,49 @@
-"""Patch vLLM source to fix RuntimeError: Already borrowed and JSONDecodeError.
+"""Patch vLLM source to fix two runtime errors observed with Qwen2.5-7B.
 
-Root cause 1 — RuntimeError: Already borrowed
-----------------------------------------------
-vLLM creates a **new** tool-parser instance for every chat-completion request.
-Each instantiation calls ``tokenizer.encode()`` to resolve special-token IDs.
-The HuggingFace fast tokenizer (backed by the Rust ``tokenizers`` crate) uses a
-``RefCell`` internally: ``no_truncation()`` / ``set_truncation_and_padding()``
-require a *mutable* borrow, but vLLM's async engine may already hold a borrow
-(e.g. while running prefill tokenization in the background).  Result:
+Errors fixed
+============
+1. ``RuntimeError: Already borrowed`` raised from the HuggingFace fast
+   tokenizer (Rust ``RefCell``) when vLLM creates a new tool-parser instance
+   per request. We wrap ``self.model_tokenizer.encode(...)`` calls in a
+   ``threading.Lock`` + retry loop, and we also retry around
+   ``tool_parser_cls(tokenizer)`` in ``serving.py``.
 
-    RuntimeError: Already borrowed
+2. ``json.JSONDecodeError: Extra data`` from
+   ``hermes_tool_parser.extract_tool_calls`` when the model emits valid JSON
+   followed by trailing text inside a ``<tool_call>`` block. We replace the
+   bare ``json.loads(match[...])`` with ``raw_decode()``-based parsing that
+   tolerates trailing content.
 
-The bug appears at max-concurrency ≥ 1 because even a single request triggers
-both the engine borrow and the parser-init borrow before the first one releases.
+Design (this version is robust against multi-line ``from … import (…)``)
+========================================================================
+Earlier patcher revisions injected a multi-line helper block after "the last
+import line", which silently corrupted files whose last import is a
+parenthesised multi-line one. To eliminate that class of bugs entirely:
 
-Root cause 2 — JSONDecodeError: Extra data
-------------------------------------------
-Qwen2.5-7B-Instruct (and other models) sometimes generates valid JSON followed
-by extra text inside the ``<tool_call>`` block.  ``json.loads()`` rejects the
-entire string with ``JSONDecodeError: Extra data``.
+* All helper code lives in a **sibling helper module**
+  ``vllm/tool_parsers/_sage_patch_helpers.py`` that the patcher writes
+  fresh on every run.
+* Each target parser file is modified with **only** two safe operations:
+    1. ``str.replace(...)`` for the call sites (preserves indentation),
+    2. **append** a single ``from … import …`` line at the end of the file.
+  Both are immune to whatever import structure exists above.
+* For ``serving.py`` we keep the regex line-rewrite, since it operates on a
+  single line at fixed indentation.
 
-Three-pronged fix (idempotent — safe to apply multiple times)
--------------------------------------------------------------
-1. **Tool parsers** (hermes, mistral, llama3_json, …): wrap every
-   ``self.model_tokenizer.encode(...)`` call in a ``threading.Lock`` with a
-   short exponential-backoff retry loop so the call waits for the other borrow
-   to finish.
+Self-healing
+============
+Every target file has a ``.sage_orig`` backup. On every run the patcher:
 
-2. **engine/serving.py**: add a retry loop around ``tool_parser_cls(tokenizer)``
-   itself, because errors can also surface there when the parser's ``__init__``
-   calls encode indirectly.
+1. Tries the local file first; if it doesn't parse and the backup parses,
+   we use the backup as the clean source.
+2. If neither parses, we download the canonical v0.18.0 source from
+   GitHub raw (no auth needed) and use that as the clean source.
+3. We always overwrite the backup with the verified-clean source so a
+   future run cannot inherit a corrupted backup.
+4. We apply edits, validate with ``ast.parse`` and only commit on success.
 
-3. **hermes_tool_parser.py** ``extract_tool_calls``: replace ``json.loads()``
-   with a ``raw_decode()``-based helper that stops at the end of the first valid
-   JSON object and silently discards any trailing content.
-
-Usage (from run_project.sh)
----------------------------
+Usage
+=====
     python src/_vllm_patches/fix_tokenizer_borrow.py /path/to/vllm-src-0.18.0
 """
 from __future__ import annotations
@@ -44,132 +51,250 @@ from __future__ import annotations
 import ast
 import re
 import sys
+import urllib.request
 from pathlib import Path
+from typing import Optional
 
-MARKER = "# _SAGE_BORROW_FIX_APPLIED"
-MARKER_JSON = "# _SAGE_JSON_FIX_APPLIED"
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+MARKER = "# _SAGE_FIX_APPLIED"  # appears in the appended import line
+SERVING_MARKER = "# _SAGE_BORROW_FIX_APPLIED"
 BACKUP_SUFFIX = ".sage_orig"
+HELPER_MODULE_NAME = "_sage_patch_helpers"
+
+# The pinned vLLM tag whose tool_parsers/ files we know are syntactically
+# valid. Used as a last-resort recovery source.
+VLLM_TAG = "v0.18.0"
+GITHUB_RAW_BASE = (
+    f"https://raw.githubusercontent.com/vllm-project/vllm/{VLLM_TAG}/vllm"
+)
+
+# Files we patch — name → relative-path-under-vllm/
+PARSER_FILES = {
+    "hermes_tool_parser.py": "tool_parsers/hermes_tool_parser.py",
+    "mistral_tool_parser.py": "tool_parsers/mistral_tool_parser.py",
+    "pythonic_tool_parser.py": "tool_parsers/pythonic_tool_parser.py",
+    "jamba_tool_parser.py": "tool_parsers/jamba_tool_parser.py",
+    "granite_20b_fc_tool_parser.py": "tool_parsers/granite_20b_fc_tool_parser.py",
+    # llama3_json_tool_parser.py and internlm_tool_parser.py do not exist
+    # at v0.18.0 and may be local-only forks; we skip them silently if absent.
+}
+
+SERVING_CANDIDATES = (
+    "vllm/entrypoints/openai/engine/serving.py",
+    "vllm/entrypoints/openai/serving_chat.py",
+    "vllm/entrypoints/openai/chat_completion/serving.py",
+)
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helper module written into vllm/tool_parsers/_sage_patch_helpers.py
 # ---------------------------------------------------------------------------
 
-def _ensure_clean_source(path: Path) -> str:
-    """Return the *original* source. Creates a backup on first call; restores
-    from backup on subsequent calls so the patcher always operates on the
-    pristine file (self-healing if a previous patch corrupted it)."""
-    backup = path.with_suffix(path.suffix + BACKUP_SUFFIX)
-    if backup.exists():
-        # Restore from backup so we always patch a clean original.
-        path.write_text(backup.read_text(encoding="utf-8"), encoding="utf-8")
-    else:
-        backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
-    return path.read_text(encoding="utf-8")
+HELPER_MODULE_SRC = '''\
+"""Runtime helpers used by SAGE patches to vLLM's tool parsers.
 
+Defined in a sibling module so we never have to inject multi-line code into
+parser files (which historically corrupted files with multi-line imports).
+"""
+from __future__ import annotations
 
-def _insert_after_imports(src: str, block: str) -> str:
-    """Insert ``block`` after the last top-level import/from statement.
+import json as _json
+import threading as _threading
+import time as _time
 
-    Uses ``ast`` to find the true *end* of the last import (handles multi-line
-    parenthesised ``from x import (...)`` blocks correctly).
-    """
-    try:
-        tree = ast.parse(src)
-    except SyntaxError:
-        tree = None
-
-    insert_line = 0  # 0-based line index to insert *before*
-    if tree is not None:
-        for node in tree.body:
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                # end_lineno is 1-based and inclusive; insert after it.
-                end = getattr(node, "end_lineno", node.lineno) or node.lineno
-                if end > insert_line:
-                    insert_line = end
-    else:
-        # Fallback: line-based scan (last single-line import/from).
-        for i, line in enumerate(src.splitlines()):
-            s = line.lstrip()
-            if s.startswith("import ") or s.startswith("from "):
-                insert_line = i + 1
-
-    lines = src.splitlines(keepends=True)
-    lines.insert(insert_line, block)
-    return "".join(lines)
-
-
-def _validate_syntax(path: Path) -> bool:
-    try:
-        ast.parse(path.read_text(encoding="utf-8"))
-        return True
-    except SyntaxError as e:
-        print(f"  SYNTAX ERROR in {path.name}: {e}")
-        return False
-
-
-def _restore_from_backup(path: Path) -> None:
-    backup = path.with_suffix(path.suffix + BACKUP_SUFFIX)
-    if backup.exists():
-        path.write_text(backup.read_text(encoding="utf-8"), encoding="utf-8")
-        print(f"  restored {path.name} from backup")
-
-
-# Code injected at module level in each tool-parser file.
-_LOCK_BLOCK = """\
-
-{marker}
-import threading as _sage_threading
-_SAGE_ENCODE_LOCK = _sage_threading.Lock()
+_ENCODE_LOCK = _threading.Lock()
 
 
 def _sage_encode(tokenizer, *args, **kwargs):
-    \"\"\"Thread-safe wrapper for tokenizer.encode() — retries on RefCell borrow conflicts.\"\"\"
-    for _i in range(30):
+    """Thread-safe wrapper for tokenizer.encode().
+
+    HuggingFace fast tokenizers (Rust ``RefCell``) raise ``RuntimeError:
+    Already borrowed`` when vLLM's async engine and a parser-init both touch
+    the tokenizer. Lock + short exponential backoff resolves the race.
+    """
+    last_exc = None
+    for i in range(30):
         try:
-            with _SAGE_ENCODE_LOCK:
+            with _ENCODE_LOCK:
                 return tokenizer.encode(*args, **kwargs)
-        except RuntimeError as _e:
-            if "Already borrowed" not in str(_e) or _i >= 29:
+        except RuntimeError as exc:
+            last_exc = exc
+            if "Already borrowed" not in str(exc):
                 raise
-            import time as _t
-            _t.sleep(0.01 * (_i + 1))
+            _time.sleep(0.01 * (i + 1))
+    raise last_exc  # type: ignore[misc]
 
-""".format(marker=MARKER)
+
+def _sage_json_load(s):
+    """Parse the first valid JSON object in *s*, ignoring trailing garbage.
+
+    Qwen2.5-7B-Instruct sometimes emits trailing text inside <tool_call>
+    blocks. ``json.loads`` rejects the whole string with
+    ``JSONDecodeError: Extra data``; ``raw_decode`` returns at the end of the
+    first valid JSON value.
+    """
+    s = (s or "").strip()
+    try:
+        obj, _ = _json.JSONDecoder().raw_decode(s)
+        return obj
+    except _json.JSONDecodeError:
+        return _json.loads(s)
+'''
+
+# Single-line import we append at the end of each patched parser file.
+APPEND_IMPORT = (
+    f"from vllm.tool_parsers.{HELPER_MODULE_NAME} import "
+    f"_sage_encode, _sage_json_load  {MARKER}\n"
+)
 
 
 # ---------------------------------------------------------------------------
-# Patch 1: tool parser files
+# Source-acquisition helpers
 # ---------------------------------------------------------------------------
 
-def patch_tool_parser(path: Path) -> None:
-    # Always restore-from/create-backup so we re-patch a pristine file each run.
-    src = _ensure_clean_source(path)
+def _parses(text: str) -> bool:
+    try:
+        ast.parse(text)
+        return True
+    except SyntaxError:
+        return False
 
-    if "self.model_tokenizer.encode(" not in src:
-        print(f"  skip (no encode pattern): {path.name}")
-        return
 
-    new_src = _insert_after_imports(src, _LOCK_BLOCK)
-    new_src = new_src.replace(
+def _strip_sage_imports(text: str) -> str:
+    """Remove any previously appended SAGE import lines so re-runs idempotently
+    rebuild the file from a clean state."""
+    return "\n".join(
+        line for line in text.splitlines() if MARKER not in line
+    ) + ("\n" if text.endswith("\n") else "")
+
+
+def _download_from_github(rel_path: str) -> Optional[str]:
+    url = f"{GITHUB_RAW_BASE}/{rel_path}"
+    try:
+        with urllib.request.urlopen(url, timeout=20) as resp:
+            if resp.status != 200:
+                return None
+            data = resp.read().decode("utf-8")
+        if not _parses(data):
+            return None
+        return data
+    except Exception as exc:
+        print(f"  warn: github fetch failed for {rel_path}: {exc}")
+        return None
+
+
+def _acquire_clean_source(path: Path, rel_path: str) -> Optional[str]:
+    """Return verified-parseable *original* source for ``path``.
+
+    Priority order — picked so re-runs always rebuild from the same pristine
+    base, never from an already-patched file (which would lose the helper
+    import on the next pass):
+
+    1. Existing ``.sage_orig`` backup if it parses cleanly.
+    2. Local file if it parses cleanly AND does not contain SAGE markers
+       (i.e. this is the first ever run); save it as the backup.
+    3. Download from GitHub at the pinned vLLM tag; save as backup.
+    """
+    backup = path.with_suffix(path.suffix + BACKUP_SUFFIX)
+
+    # 1. Trust the backup first. It's the only file we ever guarantee is the
+    # untouched original, so subsequent runs always rebuild from here.
+    if backup.exists():
+        bak = backup.read_text(encoding="utf-8")
+        if _parses(bak) and MARKER not in bak:
+            return bak
+
+    # 2. First run: take the local file IF it's clean and unmarked.
+    if path.exists():
+        local = path.read_text(encoding="utf-8")
+        if MARKER not in local and _parses(local):
+            backup.write_text(local, encoding="utf-8")
+            return local
+
+    # 3. Recover from GitHub.
+    print(f"  recovering {path.name} from GitHub ({VLLM_TAG}) …")
+    fresh = _download_from_github(rel_path)
+    if fresh is None:
+        print(f"  ERROR: could not obtain a clean source for {path.name}")
+        return None
+    backup.write_text(fresh, encoding="utf-8")
+    return fresh
+
+
+# ---------------------------------------------------------------------------
+# Patch operations
+# ---------------------------------------------------------------------------
+
+def _apply_parser_edits(src: str) -> tuple[str, int, int]:
+    """Apply call-site rewrites + append the helper import.
+
+    Returns (new_src, encode_count, json_count).
+    """
+    encode_count = src.count("self.model_tokenizer.encode(")
+    new_src = src.replace(
         "self.model_tokenizer.encode(",
         "_sage_encode(self.model_tokenizer,",
     )
-    path.write_text(new_src, encoding="utf-8")
-    if not _validate_syntax(path):
-        _restore_from_backup(path)
+
+    # json.loads(match[...] [if … else match[...]]) — only the hermes pattern.
+    json_pattern = re.compile(
+        r"\bjson\.loads\(\s*"
+        r"(match\[(?:0|1)\](?:\s+if\s+match\[(?:0|1)\]\s+else\s+match\[(?:0|1)\])?)"
+        r"\s*\)"
+    )
+    new_src, json_count = json_pattern.subn(
+        lambda m: f"_sage_json_load({m.group(1)})", new_src
+    )
+
+    if encode_count + json_count == 0:
+        return new_src, 0, 0
+
+    if not new_src.endswith("\n"):
+        new_src += "\n"
+    new_src += APPEND_IMPORT
+    return new_src, encode_count, json_count
+
+
+def write_helper_module(parsers_dir: Path) -> None:
+    target = parsers_dir / f"{HELPER_MODULE_NAME}.py"
+    target.write_text(HELPER_MODULE_SRC, encoding="utf-8")
+    print(f"  wrote helper module: {target.name}")
+
+
+def patch_parser(path: Path, rel_path: str) -> None:
+    src = _acquire_clean_source(path, rel_path)
+    if src is None:
         return
-    print(f"  patched: {path.name}")
+
+    new_src, ec, jc = _apply_parser_edits(src)
+    if ec + jc == 0:
+        # Nothing to patch; still rewrite the file to the clean source so the
+        # backup and live file are in sync.
+        path.write_text(src, encoding="utf-8")
+        print(f"  no-op (no patch sites): {path.name}")
+        return
+
+    path.write_text(new_src, encoding="utf-8")
+    if not _parses(path.read_text(encoding="utf-8")):
+        # Revert from backup on validation failure.
+        backup = path.with_suffix(path.suffix + BACKUP_SUFFIX)
+        path.write_text(backup.read_text(encoding="utf-8"), encoding="utf-8")
+        print(f"  ERROR: validation failed, reverted: {path.name}")
+        return
+    print(f"  patched: {path.name} (encode={ec}, json={jc})")
 
 
 # ---------------------------------------------------------------------------
-# Patch 2: engine/serving.py — retry around tool_parser_cls(tokenizer)
+# serving.py: regex-rewrite around tool_parser_cls(tokenizer)
 # ---------------------------------------------------------------------------
 
-# Pattern: one or more leading spaces, then "tool_parser = tool_parser_cls(tokenizer)"
 _SERVING_PATTERN = re.compile(
     r"^( +)(tool_parser\s*=\s*tool_parser_cls\(tokenizer\))",
     re.MULTILINE,
 )
+
 
 def _serving_replacement(m: re.Match) -> str:
     indent = m.group(1)
@@ -177,7 +302,7 @@ def _serving_replacement(m: re.Match) -> str:
     i2 = indent + "    "
     i3 = indent + "        "
     return (
-        f"{indent}{MARKER}\n"
+        f"{indent}{SERVING_MARKER}\n"
         f"{indent}for _sage_retry in range(30):\n"
         f"{i2}try:\n"
         f"{i3}{orig}\n"
@@ -190,95 +315,25 @@ def _serving_replacement(m: re.Match) -> str:
 
 
 def patch_serving(path: Path) -> None:
-    src = _ensure_clean_source(path)
-
+    src = path.read_text(encoding="utf-8")
+    if SERVING_MARKER in src:
+        print(f"  skip (already patched): {path.name}")
+        return
     new_src, count = _SERVING_PATTERN.subn(_serving_replacement, src)
     if count == 0:
         print(f"  skip (pattern not found): {path.name}")
         return
     path.write_text(new_src, encoding="utf-8")
-    if not _validate_syntax(path):
-        _restore_from_backup(path)
+    if not _parses(path.read_text(encoding="utf-8")):
+        path.write_text(src, encoding="utf-8")
+        print(f"  ERROR: validation failed, reverted: {path.name}")
         return
     print(f"  patched: {path.name} ({count} site(s))")
 
 
 # ---------------------------------------------------------------------------
-# Patch 3: hermes_tool_parser.py — tolerate trailing content after JSON
-# ---------------------------------------------------------------------------
-
-# Helper injected at module level in hermes_tool_parser.py.
-_JSON_HELPER_BLOCK = """\
-
-{marker}
-import json as _sage_json_mod
-
-
-def _sage_json_load(s):
-    \"\"\"Parse the first valid JSON object from *s*, ignoring trailing content.\"\"\"
-    s = (s or "").strip()
-    try:
-        obj, _ = _sage_json_mod.JSONDecoder().raw_decode(s)
-        return obj
-    except _sage_json_mod.JSONDecodeError:
-        return _sage_json_mod.loads(s)
-
-""".format(marker=MARKER_JSON)
-
-# Patterns: json.loads(match[0] if match[0] else match[1])
-# and similar single-argument json.loads() calls inside extract_tool_calls.
-# We replace every occurrence of json.loads( that follows the hermes regex
-# match variable with _sage_json_load( — the helper is module-level so
-# it's always in scope.
-_JSON_LOADS_PATTERN = re.compile(
-    r"\bjson\.loads\(\s*(match\[(?:0|1)\](?:\s+if\s+match\[(?:0|1)\]\s+else\s+match\[(?:0|1)\])?)\s*\)"
-)
-
-
-def patch_json_loads(path: Path) -> None:
-    # Snapshot current (post-borrow-fix) state in memory so we can revert just
-    # this layer without losing the prior patch.
-    pre = path.read_text(encoding="utf-8")
-    if MARKER_JSON in pre:
-        print(f"  skip (already patched json): {path.name}")
-        return
-
-    new_src, count = _JSON_LOADS_PATTERN.subn(
-        lambda m: f"_sage_json_load({m.group(1)})", pre
-    )
-    if count == 0:
-        print(f"  skip (json.loads pattern not found): {path.name}")
-        return
-
-    new_src = _insert_after_imports(new_src, _JSON_HELPER_BLOCK)
-    path.write_text(new_src, encoding="utf-8")
-    if not _validate_syntax(path):
-        path.write_text(pre, encoding="utf-8")
-        print(f"  reverted json patch on {path.name}")
-        return
-    print(f"  patched json.loads→_sage_json_load: {path.name} ({count} site(s))")
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-
-_PARSER_NAMES = (
-    "hermes_tool_parser.py",
-    "mistral_tool_parser.py",
-    "llama3_json_tool_parser.py",
-    "pythonic_tool_parser.py",
-    "jamba_tool_parser.py",
-    "internlm_tool_parser.py",
-    "granite_20b_fc_tool_parser.py",
-)
-
-_SERVING_CANDIDATES = (
-    "vllm/entrypoints/openai/engine/serving.py",
-    "vllm/entrypoints/openai/serving_chat.py",
-    "vllm/entrypoints/openai/chat_completion/serving.py",
-)
-
 
 def main() -> None:
     if len(sys.argv) < 2:
@@ -290,23 +345,22 @@ def main() -> None:
         print(f"vLLM source not found at {vllm_src}; skipping patches.")
         sys.exit(0)
 
-    print(f"Patching vLLM source at {vllm_src} ...")
+    print(f"Patching vLLM source at {vllm_src} …")
 
     parsers_dir = vllm_src / "vllm" / "tool_parsers"
     if parsers_dir.exists():
-        for name in _PARSER_NAMES:
-            p = parsers_dir / name
-            if p.exists():
-                patch_tool_parser(p)
-        # JSON fix only needed for hermes (the only parser that calls json.loads
-        # on raw regex match groups).
-        hermes = parsers_dir / "hermes_tool_parser.py"
-        if hermes.exists():
-            patch_json_loads(hermes)
+        write_helper_module(parsers_dir)
+        for fname, rel in PARSER_FILES.items():
+            p = parsers_dir / fname
+            if not p.exists():
+                # Files like llama3_json/internlm may not exist in this
+                # vLLM build — silently skip.
+                continue
+            patch_parser(p, rel)
     else:
         print(f"  tool_parsers dir not found: {parsers_dir}")
 
-    for rel in _SERVING_CANDIDATES:
+    for rel in SERVING_CANDIDATES:
         p = vllm_src / rel
         if p.exists():
             patch_serving(p)
