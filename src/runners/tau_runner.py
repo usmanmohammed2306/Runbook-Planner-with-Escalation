@@ -8,9 +8,12 @@ varies between them is the agent class instantiated per task:
   * ``act``      — :class:`baselines.ActAgent` (no reasoning prose, action-only)
   * ``react``    — :class:`baselines.ReActAgent` (one-line Thought before each
     Action)
-  * ``echo``     — :class:`echo.tau_agent.EchoAgent` (Episodic Cache + Horizon
-    Orientation: deterministic, advisory annotations on tool observations;
-    this project's contribution)
+  * ``valence``  — :class:`valence.tau_agent.ValenceAgent` (Verified
+    Affordance Lattice for Efficient Non-hallucinating Control: the LLM
+    picks one verified action_id from a compact menu, and the kernel
+    compiles it into a real benchmark tool call; mutation arguments must
+    originate from typed handles minted from prior tool evidence or exact
+    user-text spans — this project's contribution)
 
 Sharing the loop guarantees the gap between conditions is due to the
 controller and not divergent control flow / tool-result formatting.
@@ -35,7 +38,7 @@ from typing import Any, Dict, List, Tuple
 from ..common.io_utils import append_jsonl, ensure_dir, safe_mean, write_json
 
 
-AGENT_CHOICES = ["baseline", "act", "react", "echo"]
+AGENT_CHOICES = ["baseline", "act", "react", "valence"]
 
 
 def _try_install_litellm_patch() -> None:
@@ -81,9 +84,9 @@ def _resolve_agent_cls(kind: str):
     if kind == "react":
         from ..baselines.agents import ReActAgent
         return ReActAgent
-    if kind == "echo":
-        from ..echo.tau_agent import EchoAgent
-        return EchoAgent
+    if kind == "valence":
+        from ..valence.tau_agent import ValenceAgent
+        return ValenceAgent
     raise ValueError(f"Unknown agent kind: {kind}")
 
 
@@ -176,7 +179,7 @@ def _solve_one(
         provider=ns.model_provider,
         temperature=float(ns.temperature),
     )
-    if ns.agent == "echo":
+    if ns.agent == "valence":
         agent_kwargs["env_hint"] = ns.env
     agent = AgentCls(**agent_kwargs)
     try:
