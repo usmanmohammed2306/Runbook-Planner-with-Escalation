@@ -3,7 +3,7 @@
 Adds two pragmatic safeguards that the bare ``OpenAI`` client doesn't have:
 
 1. **Pre-flight message truncation** — every controller (baseline / Act /
-   ReAct / ECHO) calls the OpenAI SDK directly here, not via ``litellm``,
+   ReAct / VALENCE) calls the OpenAI SDK directly here, not via ``litellm``,
    so the sitecustomize patch that protects tau-bench's user simulator
    does NOT protect these direct calls. We monkey-patch
    ``client.chat.completions.create`` to call the same ``_shrink_messages``
