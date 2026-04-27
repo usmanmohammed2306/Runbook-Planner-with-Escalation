@@ -230,9 +230,19 @@ ACTIVE_IMPL=""
 ACTIVE_MAX_LEN=""
 
 wait_health () {
-  local url="$1" timeout="$2" slept=0 step=3
+  # Usage: wait_health <url> <timeout_s> [pid]
+  # Polls <url> until it returns 200 or <timeout_s> seconds elapse.
+  # If the optional <pid> is supplied, also exits early (return 1) if the
+  # server process dies before the health endpoint responds — this makes
+  # failed rungs bail out in seconds rather than waiting the full timeout.
+  local url="$1" timeout="$2" pid="${3:-}" slept=0 step=3
   while (( slept < timeout )); do
     curl -sf "$url" >/dev/null 2>&1 && return 0
+    # Early-exit: if the server PID died, there is no point continuing.
+    if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+      sleep 3  # let any final log lines flush
+      return 1
+    fi
     sleep "$step"; slept=$(( slept + step ))
   done
   return 1
@@ -254,7 +264,14 @@ kill_vllm () {
 trap 'kill_vllm' EXIT
 
 start_vllm_once () {
+  # Usage: start_vllm_once <model> <impl> <max_len> <mem_util> <eager> <label> [attn_backend]
+  #
+  # Optional 7th arg: VLLM_ATTENTION_BACKEND value to inject into the server
+  # environment. Use "TORCH_SDPA" when FlashAttention fails with
+  # cudaErrorNoKernelImageForDevice (GPU arch mismatch) — this forces PyTorch's
+  # built-in scaled_dot_product_attention, which works on any GPU.
   local model="$1" impl="$2" max_len="$3" mem_util="$4" eager="$5" label="$6"
+  local attn_backend="${7:-}"
   local log_file="$OUTPUTS_DIR/vllm.log"
   kill_vllm
   rm -f "$log_file"
@@ -263,27 +280,50 @@ start_vllm_once () {
   if [[ "$eager" == "1" ]]; then
     eager_flag="--enforce-eager"
   fi
-  log "Starting vLLM [$label] model=$model impl=$impl max_len=$max_len mem_util=$mem_util eager=$eager"
+  log "Starting vLLM [$label] model=$model impl=$impl max_len=$max_len mem_util=$mem_util eager=$eager${attn_backend:+ attn=$attn_backend}"
   # NOTE: $eager_flag is intentionally unquoted so the empty case expands to
   #       nothing (vllm sees no extra arg). When set, it's a single flag with
   #       no spaces, so word-splitting is safe.
-  CUDA_VISIBLE_DEVICES="$GPU" \
-    vllm serve "$model" \
-      --served-model-name "$SERVED_NAME" \
-      --port "$PORT" \
-      --model-impl "$impl" \
-      --dtype "$DTYPE" \
-      --max-model-len "$max_len" \
-      --gpu-memory-utilization "$mem_util" \
-      --enable-auto-tool-choice \
-      --tool-call-parser "$TOOL_CALL_PARSER" \
-      --disable-log-stats \
-      $eager_flag \
-      --compilation-config "$VLLM_COMPILATION_CONFIG" \
-      > "$log_file" 2>&1 &
+  #
+  # VLLM_ATTENTION_BACKEND is injected only when attn_backend is non-empty,
+  # using the `env VAR=val cmd` prefix form which limits the variable's scope
+  # to the subprocess (avoids polluting the shell for subsequent rungs).
+  if [[ -n "$attn_backend" ]]; then
+    CUDA_VISIBLE_DEVICES="$GPU" VLLM_ATTENTION_BACKEND="$attn_backend" \
+      vllm serve "$model" \
+        --served-model-name "$SERVED_NAME" \
+        --port "$PORT" \
+        --model-impl "$impl" \
+        --dtype "$DTYPE" \
+        --max-model-len "$max_len" \
+        --gpu-memory-utilization "$mem_util" \
+        --enable-auto-tool-choice \
+        --tool-call-parser "$TOOL_CALL_PARSER" \
+        --disable-log-stats \
+        $eager_flag \
+        --compilation-config "$VLLM_COMPILATION_CONFIG" \
+        > "$log_file" 2>&1 &
+  else
+    CUDA_VISIBLE_DEVICES="$GPU" \
+      vllm serve "$model" \
+        --served-model-name "$SERVED_NAME" \
+        --port "$PORT" \
+        --model-impl "$impl" \
+        --dtype "$DTYPE" \
+        --max-model-len "$max_len" \
+        --gpu-memory-utilization "$mem_util" \
+        --enable-auto-tool-choice \
+        --tool-call-parser "$TOOL_CALL_PARSER" \
+        --disable-log-stats \
+        $eager_flag \
+        --compilation-config "$VLLM_COMPILATION_CONFIG" \
+        > "$log_file" 2>&1 &
+  fi
   VLLM_PID=$!
 
-  if wait_health "http://127.0.0.1:${PORT}/health" "$VLLM_READY_TIMEOUT"; then
+  # Pass VLLM_PID so wait_health can bail early if the process crashes
+  # (e.g. cudaErrorNoKernelImageForDevice) rather than waiting the full timeout.
+  if wait_health "http://127.0.0.1:${PORT}/health" "$VLLM_READY_TIMEOUT" "$VLLM_PID"; then
     log "vLLM healthy [$label] with $model"
     ACTIVE_MODEL="$model"; ACTIVE_IMPL="$impl"; ACTIVE_MAX_LEN="$max_len"
     printf '%s\n' "$model" > "$OUTPUTS_DIR/active_model.txt"
@@ -330,16 +370,25 @@ fi
 #   1. fast:   CUDA graphs ON, primary context  (skipped if ENFORCE_EAGER=1)
 #   2. safe:   eager,         primary context  (previous known-good config)
 #   3. small:  eager,         12K context
-#   4. cpu-ish: transformers,  8K  context
+#   4. sdpa:   eager, TORCH_SDPA backend, primary context
+#              — forces PyTorch's built-in scaled_dot_product_attention,
+#              bypassing FlashAttn v2 custom CUDA kernels.  Use this when
+#              the cluster scheduler assigns a GPU with a compute capability
+#              the bundled FlashAttn wheels were not compiled for
+#              (cudaErrorNoKernelImageForDevice during _dummy_run warmup).
+#   5. cpu-ish: transformers,  8K  context
+#              — full HuggingFace transformers model runner; uses SDPA via
+#              the transformers library.  Slowest but works on any GPU.
 # ---------------------------------------------------------------------------
 STARTED=0
 for m in "${MODEL_CANDIDATES[@]}"; do
   if [[ "$ENFORCE_EAGER" != "1" ]]; then
-    if start_vllm_once "$m" "$PRIMARY_IMPL"   "$PRIMARY_MAX_LEN"   "$PRIMARY_MEM_UTIL"   "0" "fast/$m";    then STARTED=1; break; fi
+    if start_vllm_once "$m" "$PRIMARY_IMPL"   "$PRIMARY_MAX_LEN"   "$PRIMARY_MEM_UTIL"   "0" "fast/$m";          then STARTED=1; break; fi
   fi
-  if start_vllm_once   "$m" "$PRIMARY_IMPL"   "$PRIMARY_MAX_LEN"   "$PRIMARY_MEM_UTIL"   "1" "safe/$m";    then STARTED=1; break; fi
-  if start_vllm_once   "$m" "$FALLBACK1_IMPL" "$FALLBACK1_MAX_LEN" "$FALLBACK1_MEM_UTIL" "1" "small/$m";   then STARTED=1; break; fi
-  if start_vllm_once   "$m" "$FALLBACK2_IMPL" "$FALLBACK2_MAX_LEN" "$FALLBACK2_MEM_UTIL" "1" "transformers/$m"; then STARTED=1; break; fi
+  if start_vllm_once   "$m" "$PRIMARY_IMPL"   "$PRIMARY_MAX_LEN"   "$PRIMARY_MEM_UTIL"   "1" "safe/$m";          then STARTED=1; break; fi
+  if start_vllm_once   "$m" "$FALLBACK1_IMPL" "$FALLBACK1_MAX_LEN" "$FALLBACK1_MEM_UTIL" "1" "small/$m";         then STARTED=1; break; fi
+  if start_vllm_once   "$m" "$PRIMARY_IMPL"   "$PRIMARY_MAX_LEN"   "$PRIMARY_MEM_UTIL"   "1" "sdpa/$m"   "TORCH_SDPA"; then STARTED=1; break; fi
+  if start_vllm_once   "$m" "$FALLBACK2_IMPL" "$FALLBACK2_MAX_LEN" "$FALLBACK2_MEM_UTIL" "1" "transformers/$m";  then STARTED=1; break; fi
   log "All configs failed for $m; trying next candidate"
 done
 
