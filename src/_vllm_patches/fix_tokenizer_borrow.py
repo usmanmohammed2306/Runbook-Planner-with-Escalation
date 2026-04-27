@@ -185,35 +185,52 @@ def _download_from_github(rel_path: str) -> Optional[str]:
         return None
 
 
+CANONICAL_DIR = Path(__file__).resolve().parent / "canonical"
+
+
+def _read_canonical(name: str) -> Optional[str]:
+    """Return the bundled canonical copy of *name* if it exists and parses."""
+    p = CANONICAL_DIR / name
+    if not p.exists():
+        return None
+    txt = p.read_text(encoding="utf-8")
+    return txt if _parses(txt) else None
+
+
 def _acquire_clean_source(path: Path, rel_path: str) -> Optional[str]:
     """Return verified-parseable *original* source for ``path``.
 
-    Priority order — picked so re-runs always rebuild from the same pristine
-    base, never from an already-patched file (which would lose the helper
-    import on the next pass):
+    Priority order — picked so we always rebuild from a pristine base on
+    every run, regardless of whether the cluster has internet:
 
-    1. Existing ``.sage_orig`` backup if it parses cleanly.
-    2. Local file if it parses cleanly AND does not contain SAGE markers
-       (i.e. this is the first ever run); save it as the backup.
-    3. Download from GitHub at the pinned vLLM tag; save as backup.
+    1. Bundled canonical copy in ``src/_vllm_patches/canonical/``
+       (vendored from vLLM v0.18.0; this is the most reliable source).
+    2. ``.sage_orig`` backup if it parses and has no SAGE markers.
+    3. Local file if it parses and is unmarked (first ever run).
+    4. Download from GitHub at the pinned vLLM tag (best-effort).
     """
     backup = path.with_suffix(path.suffix + BACKUP_SUFFIX)
 
-    # 1. Trust the backup first. It's the only file we ever guarantee is the
-    # untouched original, so subsequent runs always rebuild from here.
+    # 1. Bundled canonical — works offline, never changes underneath us.
+    canonical = _read_canonical(path.name)
+    if canonical is not None:
+        backup.write_text(canonical, encoding="utf-8")
+        return canonical
+
+    # 2. Trust an existing pristine backup.
     if backup.exists():
         bak = backup.read_text(encoding="utf-8")
         if _parses(bak) and MARKER not in bak:
             return bak
 
-    # 2. First run: take the local file IF it's clean and unmarked.
+    # 3. First run with no canonical available: take the local file IF clean.
     if path.exists():
         local = path.read_text(encoding="utf-8")
         if MARKER not in local and _parses(local):
             backup.write_text(local, encoding="utf-8")
             return local
 
-    # 3. Recover from GitHub.
+    # 4. Last resort: GitHub.
     print(f"  recovering {path.name} from GitHub ({VLLM_TAG}) …")
     fresh = _download_from_github(rel_path)
     if fresh is None:
