@@ -97,6 +97,15 @@ HELPER_MODULE_SRC = '''\
 
 Defined in a sibling module so we never have to inject multi-line code into
 parser files (which historically corrupted files with multi-line imports).
+
+This module also runs a one-time global monkey-patch (at import time) on
+``transformers.PreTrainedTokenizerFast.set_truncation_and_padding``: that
+method calls into the Rust ``tokenizers`` crate, and the same RefCell race
+that affects tool-parser ``encode()`` also fires here when vLLM's async
+chat renderer tokenizes prompts in a thread-pool while another request is
+active. We wrap the method with a lock + retry-on-Already-borrowed loop
+so any code path through the fast tokenizer is protected, not just the
+tool-parser call sites we statically rewrite.
 """
 from __future__ import annotations
 
@@ -105,6 +114,7 @@ import threading as _threading
 import time as _time
 
 _ENCODE_LOCK = _threading.Lock()
+_TRUNC_LOCK = _threading.Lock()
 
 
 def _sage_encode(tokenizer, *args, **kwargs):
@@ -141,6 +151,44 @@ def _sage_json_load(s):
         return obj
     except _json.JSONDecodeError:
         return _json.loads(s)
+
+
+def _install_transformers_borrow_guard() -> None:
+    """Wrap ``PreTrainedTokenizerFast.set_truncation_and_padding`` so the Rust
+    ``RefCell`` race surfaced from vLLM's async chat renderer no longer
+    raises ``RuntimeError: Already borrowed`` to the API caller.
+
+    Idempotent: re-imports of this module skip if the wrapper is already in
+    place. Falls through quietly if transformers is not installed yet.
+    """
+    try:
+        from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
+    except Exception:
+        return
+
+    if getattr(PreTrainedTokenizerFast, "_sage_borrow_guard", False):
+        return
+
+    real_set = PreTrainedTokenizerFast.set_truncation_and_padding
+
+    def _guarded(self, *args, **kwargs):
+        last_exc = None
+        for i in range(30):
+            try:
+                with _TRUNC_LOCK:
+                    return real_set(self, *args, **kwargs)
+            except RuntimeError as exc:
+                last_exc = exc
+                if "Already borrowed" not in str(exc):
+                    raise
+                _time.sleep(0.01 * (i + 1))
+        raise last_exc  # type: ignore[misc]
+
+    PreTrainedTokenizerFast.set_truncation_and_padding = _guarded
+    PreTrainedTokenizerFast._sage_borrow_guard = True
+
+
+_install_transformers_borrow_guard()
 '''
 
 # Single-line import we append at the end of each patched parser file.
