@@ -1,11 +1,12 @@
-"""ACEBench Agent runner — vanilla / Act / ReAct / SAGE.
+"""ACEBench Agent runner — vanilla / Act / ReAct / ECHO.
 
 ACEBench's Agent split is scored offline against the saved trajectory.
 Tools cannot be executed live in this driver, so per-step tool results are
 stubbed; what we measure here is the *sequence of tool calls* the agent
 chooses to issue. The four controllers share an offline-stub loop and only
-differ in their system prompt or (for SAGE) in the deterministic gate that
-filters proposed calls on schema / provenance / idempotency violations.
+differ in their system prompt or (for ECHO) in the deterministic
+``EchoCache`` annotator that prepends advisory ``[echo:cache]`` /
+``[echo:diverge]`` / ``[echo:budget]`` hints to each (stubbed) observation.
 
 Outputs:
 
@@ -35,7 +36,7 @@ from ..common.openai_client import get_client
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ACE_REPO = REPO_ROOT / "external" / "ACEBench"
-AGENT_CHOICES = ["baseline", "act", "react", "sage"]
+AGENT_CHOICES = ["baseline", "act", "react", "echo"]
 
 
 def _parse_args() -> argparse.Namespace:
@@ -222,11 +223,11 @@ def _make_run_fn(agent_kind: str):
             )
         return run_fn
 
-    if agent_kind == "sage":
-        from ..sage.ace_loop import run_sage
+    if agent_kind == "echo":
+        from ..echo.ace_loop import run_echo
 
         def run_fn(*, client, model, task, max_num_steps, temperature):
-            return run_sage(
+            return run_echo(
                 client=client,
                 model=model,
                 task=task,
@@ -311,7 +312,7 @@ def main() -> int:
             "tool_coverage": coverage,
             "num_steps": sum(1 for m in res.get("messages", []) if m.get("role") == "assistant"),
             "messages": res.get("messages", []),
-            "sage_gate_stats": res.get("sage_gate_stats"),
+            "echo_stats": res.get("echo_stats"),
         }
 
     write_lock = threading.Lock()

@@ -2,7 +2,7 @@
 
 The package contains three reference policies that share a single in-process
 tool-calling loop. Differences live ONLY in the system prompt, so the
-comparison against SAGE varies a single axis (the controller) and keeps
+comparison against ECHO varies a single axis (the controller) and keeps
 the model, tools, max-steps, temperature and truncation identical.
 
 - ``ToolCallingAgent``: vanilla tool-calling. The system prompt only states

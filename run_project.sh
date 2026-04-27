@@ -7,13 +7,14 @@
 # + cu130 torch stack + vLLM 0.18.0 from source), serves a single local vLLM
 # instance, and runs 12 evaluations:
 #
-#   4 controllers (vanilla tool-calling, Act, ReAct, SAGE)
+#   4 controllers (vanilla tool-calling, Act, ReAct, ECHO)
 #   x 3 benchmarks (tau-retail, tau-airline, ACEBench Agent)
 #
 # All four controllers share the same in-process loop, model, temperature,
 # tool schemas, max steps, and truncation budget — so the only varying axis
-# is the controller (and, for SAGE only, the deterministic gate that
-# enforces schema + provenance + idempotency on every proposed call).
+# is the controller (and, for ECHO only, the deterministic EchoCache that
+# annotates tool observations with [echo:cache], [echo:diverge], and
+# [echo:budget] advisory hints — non-blocking, no extra LLM calls).
 # Produces outputs/summary/{summary.json,summary.md}.
 #
 # The venv created by setup_env.sh must already exist.
@@ -157,7 +158,7 @@ FALLBACK2_IMPL="transformers"; FALLBACK2_MAX_LEN="8192";  FALLBACK2_MEM_UTIL="0.
 #
 # Token accounting (rough, tau-retail worst case):
 #   ~20 tool specs                → ~6 000 tokens  (~10 500 chars at JSON density)
-#   system prompt (SAGE block+wiki) → ~1 500 tokens  (~ 2 500 chars)
+#   system prompt (ECHO block+wiki) → ~1 500 tokens  (~ 2 500 chars)
 #   decode headroom               → ~1 500 tokens
 #   -----------------------------------------
 #   available for message content → ~7 384 tokens
@@ -400,15 +401,15 @@ run_ace () {
 run_tau retail  baseline
 run_tau retail  act
 run_tau retail  react
-run_tau retail  sage
+run_tau retail  echo
 run_tau airline baseline
 run_tau airline act
 run_tau airline react
-run_tau airline sage
+run_tau airline echo
 run_ace baseline
 run_ace act
 run_ace react
-run_ace sage
+run_ace echo
 
 # ---------------------------------------------------------------------------
 # Summary

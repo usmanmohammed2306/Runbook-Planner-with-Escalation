@@ -8,9 +8,9 @@ varies between them is the agent class instantiated per task:
   * ``act``      — :class:`baselines.ActAgent` (no reasoning prose, action-only)
   * ``react``    — :class:`baselines.ReActAgent` (one-line Thought before each
     Action)
-  * ``sage``     — :class:`sage.tau_agent.SageAgent` (Schema-Anchored Grounded
-    Execution: deterministic provenance + schema gate; this project's
-    contribution)
+  * ``echo``     — :class:`echo.tau_agent.EchoAgent` (Episodic Cache + Horizon
+    Orientation: deterministic, advisory annotations on tool observations;
+    this project's contribution)
 
 Sharing the loop guarantees the gap between conditions is due to the
 controller and not divergent control flow / tool-result formatting.
@@ -35,7 +35,7 @@ from typing import Any, Dict, List, Tuple
 from ..common.io_utils import append_jsonl, ensure_dir, safe_mean, write_json
 
 
-AGENT_CHOICES = ["baseline", "act", "react", "sage"]
+AGENT_CHOICES = ["baseline", "act", "react", "echo"]
 
 
 def _try_install_litellm_patch() -> None:
@@ -81,9 +81,9 @@ def _resolve_agent_cls(kind: str):
     if kind == "react":
         from ..baselines.agents import ReActAgent
         return ReActAgent
-    if kind == "sage":
-        from ..sage.tau_agent import SageAgent
-        return SageAgent
+    if kind == "echo":
+        from ..echo.tau_agent import EchoAgent
+        return EchoAgent
     raise ValueError(f"Unknown agent kind: {kind}")
 
 
@@ -176,7 +176,7 @@ def _solve_one(
         provider=ns.model_provider,
         temperature=float(ns.temperature),
     )
-    if ns.agent == "sage":
+    if ns.agent == "echo":
         agent_kwargs["env_hint"] = ns.env
     agent = AgentCls(**agent_kwargs)
     try:

@@ -1,4 +1,4 @@
-# SAGE — Schema-Anchored Grounded Execution
+# ECHO — Episodic Cache + Horizon Orientation
 
 Lightweight prototype that compares **four** agent controllers **on the
 same fixed base model** across **τ-bench retail**, **τ-bench airline**,
@@ -9,82 +9,79 @@ and **ACEBench Agent**:
 | 1 | **Vanilla TC** (`baseline`) | Native function-calling, minimal system prompt. |
 | 2 | **Act** (`act`) | Yao et al. 2022 ablation: action-only, no reasoning prose. |
 | 3 | **ReAct** (`react`) | Yao et al. 2022: one-line `Thought:` before each Action. |
-| 4 | **SAGE** (`sage`, *ours*) | Deterministic gate: schema + provenance + idempotency. |
+| 4 | **ECHO** (`echo`, *ours*) | Deterministic, non-blocking advisory annotations on every tool observation: `[echo:cache]`, `[echo:diverge]`, `[echo:budget]`. |
 
 All four conditions go through the **same in-process loop, model,
 temperature, tool schemas, max-steps and truncation budget**. The only
-varying axis is the controller (and, for SAGE only, the deterministic
-gate that filters proposed calls). This makes any performance gap
-attributable to the controller — not divergent control flow or
-tool-result formatting.
+varying axis is the controller (and, for ECHO only, the deterministic
+`EchoCache` that prepends advisory hints to tool results before they
+reach the model). This makes any performance gap attributable to the
+controller — not divergent control flow or tool-result formatting.
 
-## Why SAGE — and what makes it novel
+## Why ECHO — and what makes it novel
 
-Naïve "more prompting" doesn't fix the failure modes a 7B-class model
-exhibits on multi-turn tool-use benchmarks. Inspecting failure
-trajectories under vanilla / Act / ReAct on **both τ-bench and ACEBench**
-shows that the dominant cross-domain failure is **argument hallucination**:
+Inspecting failure trajectories from prior runs of vanilla / Act / ReAct
+on a 7B-class model shows that the dominant cross-domain failure mode is
+**budget exhaustion from loops and refetches**, not bad reasoning or bad
+arguments:
 
-- the model invents an `order_id` (`order-W12345`) it never fetched;
-- it passes an `email` that wasn't in the user message;
-- it picks an `enum` value not present in the tool's schema;
-- it omits a required parameter or supplies the wrong type.
+- agents average 41–46 messages on a **30-step horizon**, repeatedly
+  re-querying the same `(tool_name, args)` until the budget runs out;
+- adding chain-of-thought prompting (ReAct) doesn't help — Qwen2.5-7B
+  already reasons implicitly between tool calls;
+- *suppressing* reasoning (Act) hurts slightly;
+- **static gating** (a deterministic schema/provenance/idempotency gate,
+  e.g. SAGE) hurts substantially — it blocks valid calls and causes
+  thrashing, which is exactly what budget-bound agents cannot afford.
 
-These failures are **invariant across domains** — they happen on
-tau-retail (where IDs come from the user simulator), on tau-airline
-(reservation codes), and on ACEBench's varied generic tools (which only
-provide a JSONSchema, no live environment).
+The right intervention therefore must be **non-blocking** and target
+**budget waste**, not argument validity.
 
-**SAGE is a domain-agnostic neuro-symbolic contract:** the LLM proposes a
-tool call; a deterministic ~250-line gate validates *three* conditions
-purely from the JSONSchema and the literal conversation transcript.
-Failures are returned as compact machine-readable feedback; the model gets
-**one** free retry to re-ground before the call is forced through to keep
-the loop alive.
+**ECHO is exactly that:** after every dispatched tool call, a tiny
+deterministic state-machine appends up to three bracketed *advisory*
+hints to the tool observation:
 
-The novelty is the specific recipe: **provenance grounding** (every
-identifier-shaped string argument must appear in the corpus) **+ JSONSchema
-validation + idempotency**, all deterministic, all in a single gate, applied
-identically to a multi-turn benchmark *and* an offline benchmark. Related
-work in 2025–26 (AgentProp-Bench runtime interceptors, Cleanlab trust
-scoring, three-layer guardrails) either uses LLM judges, fine-tuning, or
-schema-only checks — none combine literal-context provenance with schema
-in a single deterministic gate that ports unchanged from tau-bench to
-ACEBench.
-
-## Why SAGE generalizes where IG-RPE didn't
-
-An earlier in-tree variant (IG-RPE) hardcoded retail/airline-specific
-invariants (`user_verified`, `order_fetched`, `user_confirmed`). It helped
-on tau-bench but was neutral on ACEBench, where the tool vocabulary is
-varied and there is no user simulator. **SAGE removes every domain term**:
-it only reads from (a) the tool's JSONSchema and (b) the raw conversation
-transcript. The same module drives both the tau-bench `Agent` subclass and
-the ACEBench offline-stub loop without modification.
-
-## The three checks enforced on every proposed call
-
-| Check | What it enforces |
+| Hint | When it fires |
 |---|---|
-| `schema` | Required parameters present; types match (`string`, `integer`, `number`, `boolean`, `array`, `object`); enum values are within the allowed set. |
-| `provenance` | Every identifier-shaped string argument (length 3–80, no whitespace, contains a digit / `@` / `-` / `_` / `/`, or is an ALL-CAPS short code) literally appears in the conversation corpus: user messages, prior tool observations, system prompt, or any of the tool schemas' enum values. Free-form prose arguments (e.g., `content: "yes please"`) are NOT checked. |
-| `idempotency` | The same `(tool, normalized_args)` is not issued twice; a tool that has errored ≥ 2 times is not retried with similar args. |
+| `[echo:cache]` | The same `(tool_name, canonical_args(args))` was already dispatched earlier in this episode. |
+| `[echo:diverge]` | The same tool name has now been used three times in a row (regardless of args). |
+| `[echo:budget]` | At exactly 7 and 3 steps remaining: a budget reminder ("consider closing soon" / "respond now if you have an answer"). |
 
-On block, a JSON object is returned as the tool result:
+The full original observation is always preserved; the hints are
+prepended on a separate line. The model is **never** denied a tool
+result. There is **no retry loop, no gate, no extra LLM call**. By
+construction ECHO cannot perform worse than the baseline — only better,
+when the hints succeed in steering the model out of a wasteful loop.
 
-```json
-{
-  "sage_blocked": true,
-  "tool": "cancel_pending_order",
-  "checks_failed": ["ungrounded_arg:order_id:order-W99999"],
-  "guidance": "- ungrounded_arg: ... fetch the value from a prior tool first, or ask the user.",
-  "next_step": "Re-examine the conversation, fetch any missing IDs via a READ tool, ..."
-}
-```
+## Why ECHO generalises across tau-bench *and* ACEBench
 
-The LLM receives this on its next turn and either re-grounds or asks the
-user for the missing value. The retry budget replenishes after any
-successful dispatch.
+The same `EchoCache` drives both the live tau-bench loop and the
+offline-stub ACEBench loop with no modification:
+
+- **tau-bench (live)**: the user simulator and live env-step are
+  unchanged. ECHO annotates every real observation; the cache hint
+  breaks user-data refetch loops, the budget hint forces commit before
+  the 30-step ceiling.
+- **ACEBench (offline-stub)**: tool results are stubbed JSON, but the
+  ECHO annotations still help — the agent stops calling the same tool
+  twice and uses the freed budget to cover the *expected* tool set,
+  improving name-coverage scoring.
+
+ECHO reads zero domain-specific information: just the tool name, the
+canonical-JSON of the arguments, and the loop step counter. The same
+~80 lines drive both benchmarks.
+
+## The three signals — full spec
+
+| Signal | Trigger | Annotation prepended |
+|---|---|---|
+| `cache` | Same `(name, json.dumps(args, sort_keys=True))` seen earlier in this episode. | "this exact call (tool='X', same arguments) was already dispatched at step N; if the observation is unchanged, a different action is likely needed." |
+| `diverge` | Last two dispatches were also `name` (this would be the 3rd in a row). | "tool 'X' has now been used 3 times in a row; consider a different tool or respond if you have enough information." |
+| `budget` | `max_num_steps - step - 1 == 7` (warn) or `== 3` (commit). | "K steps remaining — consider closing the task soon" / "K steps remaining — respond now with a final answer if you have one." |
+
+Per-trajectory ECHO records include `info.echo_stats` so you can audit
+firing rates: `tool_calls_seen`, `cache_hits`, `diverge_hits`,
+`budget_warn`, `budget_commit`, `unique_calls`.
 
 ## Fixed base model (priority order)
 
@@ -119,17 +116,13 @@ Outputs:
 outputs/
   active_model.txt
   vllm.log
-  tau_retail_baseline/   tau_retail_act/   tau_retail_react/   tau_retail_sage/
-  tau_airline_baseline/  tau_airline_act/  tau_airline_react/  tau_airline_sage/
-  acebench_agent_baseline/ acebench_agent_act/ acebench_agent_react/ acebench_agent_sage/
+  tau_retail_baseline/   tau_retail_act/   tau_retail_react/   tau_retail_echo/
+  tau_airline_baseline/  tau_airline_act/  tau_airline_react/  tau_airline_echo/
+  acebench_agent_baseline/ acebench_agent_act/ acebench_agent_react/ acebench_agent_echo/
   summary/
-    summary.json   # 4-way comparison + SAGE-vs-best-baseline deltas
+    summary.json   # 4-way comparison + ECHO-vs-best-baseline deltas
     summary.md     # rendered table
 ```
-
-Per-trajectory SAGE records include `info.sage_gate_stats` for debugging
-(allowed / blocked / retries, plus a histogram of which check tripped:
-`schema`, `provenance`, `idempotency`).
 
 ## Time budget
 
@@ -144,16 +137,19 @@ concurrently against the shared vLLM server (`TAU_MAX_CONCURRENCY=4` by
 default), which batches requests internally — the GPU is the bottleneck,
 not the Python loop.
 
-## What SAGE is and isn't
+## What ECHO is and isn't
 
-SAGE is **lightweight on purpose**: no search tree, no external memory, no
-second model, no fine-tuning, no LLM judge. The gate is ~250 lines of
-deterministic Python. The provenance check is literal substring matching
-into a lower-cased corpus. The schema check reads the tool's JSONSchema
-directly. The idempotency check is a hash-set lookup. Zero extra LLM calls
-on the happy path; ≤ 1 retry-call on a blocked tool — so the wall-clock
-cost is essentially the same as the baselines.
+ECHO is **lightweight on purpose**: no search tree, no external memory,
+no second model, no fine-tuning, no LLM judge, no gate. The whole novel
+mechanism is one `dataclass` (`EchoCache`) with a single `annotate`
+method — see `src/echo/cache.py`. The annotation is literal string
+prepending; the cache key is `json.dumps(args, sort_keys=True)`; the
+divergence check is a 3-element tail comparison; the horizon trigger is
+two integer equality checks.
 
-The same base model is used as the three baselines — the only thing changed
-between conditions is the controller itself (and, for SAGE only, the
-deterministic gate).
+**Zero extra LLM calls on every path** — so the wall-clock cost is
+exactly the same as the baselines.
+
+The same base model is used as the three baselines — the only thing
+changed between conditions is the controller itself (and, for ECHO only,
+the deterministic annotator).
